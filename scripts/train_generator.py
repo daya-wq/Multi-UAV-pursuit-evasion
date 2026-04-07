@@ -86,8 +86,7 @@ def set_seed(seed):
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="train")
 def main(cfg):
-    seed = 42
-    set_seed(seed)
+    set_seed(cfg.seed)
 
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
@@ -175,7 +174,7 @@ def main(cfg):
 
     agent_spec: AgentSpec = env.agent_spec["drone"]
     # add base_env.TP to MAPPOPolicy
-    policy = algos[cfg.algo.name.lower()](cfg.algo, agent_spec=agent_spec, device="cuda", TP_net=base_env.TP)
+    policy = algos[cfg.algo.name.lower()](cfg.algo, agent_spec=agent_spec, device=cfg.sim.device, TP_net=base_env.TP)
 
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
     total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch

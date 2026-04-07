@@ -6,6 +6,7 @@ import hydra
 import torch
 import numpy as np
 import wandb
+import datetime
 
 from functorch import vmap
 from omegaconf import OmegaConf
@@ -168,7 +169,7 @@ def main(cfg):
 
     agent_spec: AgentSpec = env.agent_spec["drone"]
     # add base_env.TP to MAPPOPolicy
-    policy = algos[cfg.algo.name.lower()](cfg.algo, agent_spec=agent_spec, device="cuda", TP_net=base_env.TP)
+    policy = algos[cfg.algo.name.lower()](cfg.algo, agent_spec=agent_spec, device=cfg.sim.device, TP_net=base_env.TP)
 
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
     total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
@@ -197,64 +198,105 @@ def main(cfg):
         base_env.eval()
         env.eval()
         env.set_seed(seed)
+        if hasattr(base_env, "set_training_progress"):
+            base_env.set_training_progress(1.0)
 
         from tqdm import tqdm
-        t = tqdm(total=base_env.max_episode_length)
         
-        def record_frame(*args, **kwargs):
-            frame = env.base_env.render(mode="rgb_array")
-            frames.append(frame)
-            t.update(2)
+        tensordict = env.reset()
+        step_count = 0
 
-        trajs = env.rollout(
-            max_steps=base_env.max_episode_length,
-            policy=lambda x: policy(x, deterministic=True),
-            callback=Every(record_frame, 2),
-            auto_reset=True,
-            break_when_any_done=False,
-            return_contiguous=False
-        ).clone()
-        # save trajectory
-        # np.save('track.npy', trajs[0]['stats']['drone_state'].to('cpu').numpy())
-        # save ctbr
-        # action = torch.tanh(trajs[0]['agents']['action'])
-        # target_rate, target_thrust = action.split([3, 1], -1)
-        # target_thrust = ((target_thrust + 1) / 2).clip(0.)
-        # np.save('ctbr.npy', torch.concat([target_rate, target_thrust], dim=-1).to('cpu').numpy())
-        # breakpoint()
+        for _ in tqdm(range(base_env.max_episode_length)):
+            if step_count % 2 == 0:
+                frame = env.base_env.render(mode="rgb_array")
+                frames.append(frame)
+
+            tensordict = env.step(policy(tensordict, deterministic=True))
+
+            done = tensordict.get(("next", "done"))
+            if done.any():
+                stats = tensordict.get(("next", "stats"))
+                print(f"\n" + "="*60)
+                print(f"🎬 Video Recording Stopped at Step {step_count}")
+                if "success" in stats.keys() and stats["success"].any():
+                    print("🏆 Termination Reason: 捕获成功 (Success) !!!")
+                elif "goal_reached" in stats.keys() and stats["goal_reached"].any():
+                    print("🎯 Termination Reason: 目标进入守区 (Goal Reached) !!!")
+                elif "any_landed" in stats.keys() and stats["any_landed"].any():
+                    print("💥 Termination Reason: 坠机或撞地 (Crashed/Landed) !!!")
+                else:
+                    print("🚧 Termination Reason: 出界或受到碰撞等其它中断条件 (Out of bounds / Collision) !!!")
+                print("="*60 + "\n")
+                break
+
+            tensordict = tensordict.get("next")
+            step_count += 1
+            
+        if step_count >= base_env.max_episode_length:
+            print(f"\n" + "="*60)
+            print(f"🎬 Video Recording Stopped at Step {step_count}")
+            print("⏳ Termination Reason: 达到最大步数限制 (Timeout 800 steps) !!!")
+            print("="*60 + "\n")
 
         base_env.enable_render(not cfg.headless)
 
-        done = trajs.get(("next", "done"))
-        first_done = torch.argmax(done.long(), dim=1).cpu()
-
-        def take_first_episode(tensor: torch.Tensor):
-            indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
-            return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-        traj_stats = {
-            k: take_first_episode(v)
-            for k, v in trajs[("next", "stats")].cpu().items()
-        }
-
-        info = {
-            "eval/stats." + k: torch.nanmean(v.float()).item() 
-            for k, v in traj_stats.items()
-        }
+        # Get final stats
+        stats_dict = tensordict.get(("next", "stats"), {})
+        info = {}
+        for k, v in stats_dict.items():
+            info["eval/stats." + k] = torch.nanmean(v.float()).item()
 
         if len(frames):
             # video_array = torch.stack(frames)
             video_array = np.stack(frames).transpose(0, 3, 1, 2)
+            frames_rgb = np.stack(frames)  # keep HWC for local save
+
+            # Save the local artifact first so local review does not depend on wandb.
+            time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            video_dir = os.path.join(project_root, "eval_videos")
+            os.makedirs(video_dir, exist_ok=True)
+            video_path = os.path.join(video_dir, f"{cfg.task.name}_{time_str}.mp4")
+            fps = int(0.5 / cfg.sim.dt)
+            saved_artifact_path = None
+            try:
+                import imageio
+                imageio.mimwrite(video_path, frames_rgb, fps=fps)
+                saved_artifact_path = video_path
+                logging.info(f"Video saved to {video_path}")
+            except Exception as exc:
+                # Fallback: keep raw frames even if ffmpeg/imageio export fails.
+                npy_path = video_path.replace(".mp4", ".npy")
+                np.save(npy_path, frames_rgb)
+                saved_artifact_path = npy_path
+                logging.warning(
+                    "Failed to save mp4 (%s); frames saved to %s",
+                    exc,
+                    npy_path,
+                )
+
+            info["eval/local_recording_path"] = saved_artifact_path
             frames.clear()
-            info["recording"] = wandb.Video(
-                video_array, fps=0.5 / cfg.sim.dt, format="mp4"
-            )
-        
+            try:
+                info["recording"] = wandb.Video(
+                    video_array, fps=fps, format="mp4"
+                )
+            except Exception as exc:
+                logging.warning("wandb.Video export failed: %s", exc)
+
         return info
 
     info = {}
     info.update(evaluate())
+    
+    import pprint
+    print("-" * 40)
+    print("Evaluation Stats:")
+    pprint.pprint({k: v for k, v in info.items() if not isinstance(v, wandb.Video)})
+    print("-" * 40)
+
     run.log(info)
+
     wandb.finish()
     
     simulation_app.close()

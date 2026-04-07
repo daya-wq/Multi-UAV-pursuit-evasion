@@ -16,41 +16,91 @@ time_encoding: true
 action_transform: PIDrate
 
 # exp
-max_agents: 3
+max_agents: 4
 num_agents: 3
 
 # flag
 use_partial_obs: 1
-use_eval: 1 # use_eval = 1 for evaluation, fixed init states
-use_random_cylinder: 0 # set use_random_cylinder = 0 when use_eval = 1; use_random_cylinder = 0, means scenario_flag is valid
-scenario_flag: 'wall' # 'empty', 'wall', 'narrow_gap', 'random', 'passage'
-cylinder:
-  size: 0.1
-  fixed_num: null # None: random num and pos, else only fixed num, random pos
-  min_num: 4
-  max_num: 6
-  obs_max_cylinder: 3
+use_eval: 1 # eval keeps fixed goal-defense layout; training goal-defense uses curriculum reset when enabled
+scenario_flag: 'goal_defense'
 
 # TP net param
 history_step: 10
 future_predcition_step: 5
 window_step: 1
-use_obstacles: 0
 
-arena_size: 0.9
-max_height: 1.2
+curriculum:
+  enabled: true
+  eval_uses_fixed_layout: true
+  ema_alpha: 0.10
+  min_stage_episodes: 100
+  target_spawn_x: [-0.9, -0.2]
+  target_spawn_y: [-1.0, 1.0]
+  target_z_jitter: 0.15
+  drone_z_jitter: 0.15
+  drone_min_separation: 0.30
+  max_sample_attempts: 64
+  stages:
+    - pursuer_target_dist: [0.3, 0.8]
+      target_speed: 0.5
+      promote_success: 0.60
+      promote_capture_step: 400
+    - pursuer_target_dist: [0.5, 1.5]
+      target_speed: 0.8
+      promote_success: 0.50
+    - pursuer_target_dist: [1.0, 2.5]
+      target_speed: 1.0
+
+arena_size: 2.5
+max_height: 5.0
 v_drone: 1.0
-v_prey: 1.3
+v_prey: 1.0
 
-dist_reward_coef: 1.0
-catch_reward_coef: 60.0
-detect_reward_coef: 0.0
-collision_coef: 100.0
-speed_coef: 10.0
+# normalized goal-defense reward
+# First priority: actually catch the target.
+# Dense shaping is kept, but weakened so it helps the chase
+# instead of replacing the real task objective.
+catch_reward_coef: 40.0
+goal_penalty_coef: 20.0
+timeout_penalty_coef: 8.0
+goal_progress_coef: 0.15
+capture_progress_coef: 0.30
+goal_progress_scale: 0.05
+capture_progress_scale: 0.05
+coop_phi_coef: 0.08
+coop_diff_coef: 0.18
+coop_reward_init: 0.20
+coop_reward_final: 0.08
+coop_anneal_portion: 0.50
+di_scale: 0.15
+urgent_goal_dist: 0.80
+urgent_goal_tau: 0.15
+block_margin: 0.15
+block_softness: 0.10
+block_between_softness: 0.15
+block_lateral_scale: 0.35
+pressure_dist_scale: 0.80
+collision_coef: 2.0
+speed_coef: 0.05
 smoothness_coef: 0.0
+time_penalty_coef: 0.005
+ground_collision_height: 0.10
+landed_z_threshold: 0.12
+landed_speed_threshold: 0.10
+landed_penalty_coef: 8.0
+
+# goal-defense target dynamics
+goal_region_radius: 0.5
+goal_region_height: 2.0
+goal_region_center: [2.0, 0.0, 2.5]
+target_goal_attraction_coef: 1.0
+target_accel_limit: 2.0
+target_velocity_damping: 0.25
+target_command_tau: 0.15
+target_physics_max_velocity: 5.0
 
 # env param
-catch_radius: 0.3
+catch_radius: 0.4
 drone_detect_radius: 100.0
 target_detect_radius: 100.0
 collision_radius: 0.07

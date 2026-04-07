@@ -87,7 +87,7 @@ class IsaacEnv(EnvBase):
             backend="torch",
             sim_params=sim_params,
             physics_prim_path="/physicsScene",
-            device="cuda:0",
+            device=str(self.cfg.sim.device),
         )
         self._create_viewport_render_product()
         self.dt = self.sim.get_physics_dt()
@@ -194,18 +194,21 @@ class IsaacEnv(EnvBase):
         raise NotImplementedError
 
     def close(self):
-        return # TODO: fix this
         if not self._is_closed:
-            # stop physics simulation (precautionary)
-            self.sim.stop()
-            # cleanup the scene and callbacks
-            self.sim.clear_all_callbacks()
-            self.sim.clear()
-            # fix warnings at stage close
-            omni.usd.get_context().get_stage().GetRootLayer().Clear()
-            # update closing status
-            self._is_closed = True
-            logging.info("IsaacEnv closed.")
+            try:
+                # stop physics simulation (precautionary)
+                self.sim.stop()
+                # cleanup the scene and callbacks
+                self.sim.clear_all_callbacks()
+                self.sim.clear()
+                # fix warnings at stage close
+                omni.usd.get_context().get_stage().GetRootLayer().Clear()
+            except Exception as e:
+                logging.warning(f"Error during IsaacEnv cleanup: {e}")
+            finally:
+                # update closing status
+                self._is_closed = True
+                logging.info("IsaacEnv closed.")
 
     def _reset(self, tensordict: TensorDictBase, **kwargs) -> TensorDictBase:
         if tensordict is not None:

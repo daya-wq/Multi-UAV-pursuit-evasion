@@ -605,15 +605,15 @@ class HideAndSeek_envgen(IsaacEnv):
             TP_spec = CompositeSpec({
                 "TP_input": UnboundedContinuousTensorSpec((self.history_step, 1 + 3 + 3 + self.num_agents * 3 + self.num_cylinders * 3)),
                 # "TP_output": UnboundedContinuousTensorSpec((self.future_predcition_step, 3)),
-                "TP_groundtruth": UnboundedContinuousTensorSpec((1, 3)),
-                "TP_done": UnboundedContinuousTensorSpec((1, 3)),
+                "TP_groundtruth": UnboundedContinuousTensorSpec(3),
+                "TP_done": UnboundedContinuousTensorSpec(1),
             }).to(self.device)
         else:
             TP_spec = CompositeSpec({
                 "TP_input": UnboundedContinuousTensorSpec((self.history_step, 1 + 3 + 3 + self.num_agents * 3)),
                 # "TP_output": UnboundedContinuousTensorSpec((self.future_predcition_step, 3)),
-                "TP_groundtruth": UnboundedContinuousTensorSpec((1, 3)),
-                "TP_done": UnboundedContinuousTensorSpec((1, 3)),
+                "TP_groundtruth": UnboundedContinuousTensorSpec(3),
+                "TP_done": UnboundedContinuousTensorSpec(1),
             }).to(self.device)
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({

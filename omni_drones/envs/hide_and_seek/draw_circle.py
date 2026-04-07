@@ -88,7 +88,8 @@ def _draw_lines_args_merger(*args):
 
 def draw_court_circle(
     R: float, H: float, color_edge: _COLOR_T = (1.0, 1.0, 1.0, 1.0), 
-    color_wall = (1.0, 1.0, 1.0, 1.0), line_size: float = 10.0, num_points: int = 200
+    color_wall = (1.0, 1.0, 1.0, 1.0), line_size: float = 10.0, num_points: int = 200,
+    wall_alpha: float = 0.1
 ):
-    return _draw_lines_args_merger(draw_wall_circle(R, H, color=color_wall, line_size=line_size, num_points=num_points), 
+    return _draw_lines_args_merger(draw_wall_circle(R, H, color=color_wall, alpha=wall_alpha, line_size=line_size, num_points=num_points), 
                                    draw_edge_circle(R, H, color=color_edge, line_size=line_size, num_points=num_points))

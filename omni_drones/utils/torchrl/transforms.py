@@ -383,6 +383,7 @@ class RateController(Transform):
     def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
         drone_state = tensordict[("info", "drone_state")][..., :13]
         action = tensordict[self.action_key]
+        tensordict.set((*self.action_key[:-1], "action_raw"), action.clone())
         action = torch.tanh(action)
         target_rate, target_thrust = action.split([3, 1], -1)
         if self.fixed_yaw:
@@ -425,6 +426,7 @@ class PIDRateController(Transform):
     def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
         drone_state = tensordict[("info", "drone_state")][..., :13]
         action = tensordict[self.action_key]
+        tensordict.set((*self.action_key[:-1], "action_raw"), action.clone())
 
         action = torch.tanh(action)
         # action: [-1, 1]

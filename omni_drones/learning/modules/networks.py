@@ -311,6 +311,107 @@ class PartialAttentionEncoder(nn.Module):
     def _ff_block(self, x: Tensor):
         x = self.linear2(self.activation(self.linear1(x)))
         return x
+
+
+@register(ENCODERS_MAP)
+class CoopEntityAttentionEncoder(nn.Module):
+    """Self-centric entity encoder for cooperative goal-defense observations.
+
+    Expected observation keys:
+    - ``state_self``: [B, 1, self_dim]
+    - ``cooperation``: [B, 1, coop_dim]
+    - ``state_others``: [B, N-1, other_dim]
+    - optional ``cylinders``: [B, K, cyl_dim]
+
+    The output is the encoded self token after attending to teammates and
+    obstacle entities.
+    """
+
+    def __init__(
+        self,
+        input_spec: CompositeSpec,
+        *,
+        embed_dim: int = 128,
+        num_heads: int = 4,
+        dim_feedforward: int = 256,
+        num_layers: int = 2,
+        layer_norm: bool = True,
+    ) -> None:
+        super().__init__()
+
+        required_keys = {"state_self", "cooperation", "state_others"}
+        missing_keys = required_keys.difference(input_spec.keys())
+        if missing_keys:
+            missing = ", ".join(sorted(missing_keys))
+            raise ValueError(
+                f"CoopEntityAttentionEncoder requires keys {sorted(required_keys)}, "
+                f"but is missing: {missing}"
+            )
+
+        self.embed_dim = embed_dim
+        self.output_shape = torch.Size((embed_dim,))
+        self.self_embed = nn.Linear(
+            input_spec["state_self"].shape[-1] + input_spec["cooperation"].shape[-1],
+            embed_dim,
+        )
+        self.other_embed = nn.Linear(input_spec["state_others"].shape[-1], embed_dim)
+        self.cylinder_embed = (
+            nn.Linear(input_spec["cylinders"].shape[-1], embed_dim)
+            if "cylinders" in input_spec.keys()
+            else None
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=0.0,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.token_norm = nn.LayerNorm(embed_dim) if layer_norm else None
+
+    @staticmethod
+    def _masked_rows(x: Tensor) -> Tensor:
+        if x.numel() == 0:
+            return torch.zeros(*x.shape[:-1], dtype=torch.bool, device=x.device)
+        return (x < -4.5).all(dim=-1)
+
+    def forward(self, x: TensorDict):
+        state_self = x["state_self"].squeeze(-2)
+        cooperation = x["cooperation"].squeeze(-2)
+        self_token = self.self_embed(torch.cat([state_self, cooperation], dim=-1)).unsqueeze(-2)
+
+        batch_shape = self_token.shape[:-2]
+        other_values = x["state_others"]
+        if other_values.shape[-2] > 0:
+            other_tokens = self.other_embed(other_values)
+            other_mask = self._masked_rows(other_values)
+        else:
+            other_tokens = self_token.new_zeros(*batch_shape, 0, self.embed_dim)
+            other_mask = torch.zeros(*batch_shape, 0, dtype=torch.bool, device=self_token.device)
+
+        token_chunks = [self_token, other_tokens]
+        mask_chunks = [
+            torch.zeros(*batch_shape, 1, dtype=torch.bool, device=self_token.device),
+            other_mask,
+        ]
+
+        if self.cylinder_embed is not None:
+            cylinder_values = x["cylinders"]
+            cylinder_tokens = self.cylinder_embed(cylinder_values)
+            cylinder_mask = self._masked_rows(cylinder_values)
+            token_chunks.append(cylinder_tokens)
+            mask_chunks.append(cylinder_mask)
+
+        tokens = torch.cat(token_chunks, dim=-2)
+        key_padding_mask = torch.cat(mask_chunks, dim=-1)
+        flat_tokens = tokens.reshape(-1, tokens.shape[-2], tokens.shape[-1])
+        flat_mask = key_padding_mask.reshape(-1, key_padding_mask.shape[-1])
+        if self.token_norm is not None:
+            flat_tokens = self.token_norm(flat_tokens)
+        encoded = self.transformer(flat_tokens, src_key_padding_mask=flat_mask)
+        return encoded[:, 0, :].reshape(*batch_shape, -1)
     
 
 ################################## Vision Encoders ##################################

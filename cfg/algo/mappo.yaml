@@ -7,7 +7,15 @@ ppo_epochs: 4
 use_TP_net: 1
 TP_epochs: 1
 clip_param: 0.1
-entropy_coef: 0.0
+entropy_coef: 0.005
+entropy_schedule:
+  enabled: true
+  hold_coef: 0.01
+  release_coef: 0.003
+  success_threshold: 0.50
+  success_target: 0.80
+  ema_alpha: 0.05
+  min_env_frames: 10000000
 gae_lambda: 0.95
 gamma: 0.995
 max_grad_norm: 10.0
@@ -15,12 +23,15 @@ normalize_advantages: True
 
 reward_weights: null # null means all 1.0
 share_actor: True
-critic_input: obs # `obs` or `state`
+critic_input: state # `obs` or `state`
 
 actor:
   lr: 0.0005
-  lr_scheduler: 
-  lr_scheduler_kwargs: 
+  lr_scheduler: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  lr_scheduler_kwargs:
+    T_0: 1000
+    T_mult: 2
+    eta_min: 0.00005
   
   # mlp
   hidden_units: [256, 256, 256]
@@ -30,10 +41,18 @@ actor:
   gain: 0.01
 
   vision_encoder: MobileNetV3Small
-  attn_encoder: PartialAttentionEncoder # if applicable
+  attn_encoder: CoopEntityAttentionEncoder # self token + teammate entities + local cylinders
   use_orthogonal: true
 
   tanh: false
+  log_std_init: 0.0
+  log_std_min: -2.0
+  log_std_max: 0.5
+  bc_aux:
+    enabled: false
+    hidden_dim: 256
+    condition_action_on_aux: true
+    condition_hidden_dim: 256
 
   # rnn:
   #   cls: gru
@@ -49,8 +68,11 @@ critic:
       beta: 0.995
 
   lr: 0.0005
-  lr_scheduler: 
-  lr_scheduler_kwargs: 
+  lr_scheduler: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  lr_scheduler_kwargs:
+    T_0: 1000
+    T_mult: 2
+    eta_min: 0.00005
 
   # mlp
   hidden_units: [256, 256, 256]
@@ -69,6 +91,6 @@ critic:
   #   train_seq_len: 16
 
   vision_encoder: MobileNetV3Small
-  attn_encoder: PartialAttentionEncoder # if applicable
+  attn_encoder: RelationEncoder # CTDE critic over global drone + obstacle entities
   use_feature_normalization: true
   use_orthogonal: true

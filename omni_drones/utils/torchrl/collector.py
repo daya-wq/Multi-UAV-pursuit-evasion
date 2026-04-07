@@ -52,8 +52,6 @@ class SyncDataCollector(_SyncDataCollector):
             self._iter = i
             tensordict_out = self.rollout()
             self._frames += tensordict_out.numel()
-            if self._frames >= total_frames:
-                self.env.close()
 
             if self.split_trajs:
                 tensordict_out = split_trajectories(

@@ -365,15 +365,15 @@ class HideAndSeek_deploy(IsaacEnv):
             TP_spec = CompositeSpec({
                 "TP_input": UnboundedContinuousTensorSpec((self.history_step, 1 + 3 + 3 + self.num_agents * 3 + self.num_cylinders * 3)),
                 # "TP_output": UnboundedContinuousTensorSpec((self.future_predcition_step, 3)),
-                "TP_groundtruth": UnboundedContinuousTensorSpec((1, 3)),
-                "TP_done": UnboundedContinuousTensorSpec((1, 3)),
+                "TP_groundtruth": UnboundedContinuousTensorSpec(3),
+                "TP_done": UnboundedContinuousTensorSpec(1),
             }).to(self.device)
         else:
             TP_spec = CompositeSpec({
                 "TP_input": UnboundedContinuousTensorSpec((self.history_step, 1 + 3 + 3 + self.num_agents * 3)),
                 # "TP_output": UnboundedContinuousTensorSpec((self.future_predcition_step, 3)),
-                "TP_groundtruth": UnboundedContinuousTensorSpec((1, 3)),
-                "TP_done": UnboundedContinuousTensorSpec((1, 3)),
+                "TP_groundtruth": UnboundedContinuousTensorSpec(3),
+                "TP_done": UnboundedContinuousTensorSpec(1),
             }).to(self.device)
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -712,9 +712,11 @@ class HideAndSeek_deploy(IsaacEnv):
             cylinder_pos_z[self.inactive_mask] = self.invalid_z
             cylinders_pos = torch.concat([cylinders_pos_xy, cylinder_pos_z], dim=-1)
         else:
+            # Fixed scenarios keep per-env obstacle counts for all environments.
+            active_cylinders = self.active_cylinders[env_ids]
             self.inactive_mask = torch.arange(self.num_cylinders, device=self.device).unsqueeze(0).expand(len(env_ids), -1)
             # inactive = True, [envs, self.num_cylinders]
-            self.inactive_mask = self.inactive_mask >= self.active_cylinders
+            self.inactive_mask = self.inactive_mask >= active_cylinders
                
         # drone_pos = self.init_drone_pos_dist.sample((*env_ids.shape, self.num_agents))
         rpy = self.init_rpy_dist.sample((*env_ids.shape, self.num_agents))

@@ -64,7 +64,16 @@ _mappings = {
 
 
 class DiagGaussian(nn.Module):
-    def __init__(self, num_inputs, num_outputs, use_orthogonal=False, gain=0.01):
+    def __init__(
+        self,
+        num_inputs,
+        num_outputs,
+        use_orthogonal=False,
+        gain=0.01,
+        log_std_init=0.0,
+        log_std_min=-5.0,
+        log_std_max=1.0,
+    ):
         super(DiagGaussian, self).__init__()
 
         init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][use_orthogonal]
@@ -73,11 +82,14 @@ class DiagGaussian(nn.Module):
             return init(m, init_method, lambda x: nn.init.constant_(x, 0), gain)
 
         self.fc_mean = init_(nn.Linear(num_inputs, num_outputs))
-        self.log_std = nn.Parameter(torch.zeros(num_outputs))
+        self.log_std = nn.Parameter(torch.full((num_outputs,), float(log_std_init)))
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
 
     def forward(self, x):
         action_mean = self.fc_mean(x)
-        action_std = torch.broadcast_to(torch.exp(self.log_std), action_mean.shape)
+        log_std = self.log_std.clamp(self.log_std_min, self.log_std_max)
+        action_std = torch.broadcast_to(torch.exp(log_std), action_mean.shape)
         dist = D.Independent(D.Normal(action_mean, action_std), 1)
         return dist
 
@@ -424,4 +436,3 @@ class TwoHot(D.Distribution):
         target = target.squeeze(-2)
 
         return (target * log_pred).sum(-1)
-
