@@ -407,6 +407,7 @@ class PIDRateController(Transform):
         self,
         controller,
         action_key: str = ("agents", "action"),
+        actor_has_tanh: bool = False,
     ):
         super().__init__([], in_keys_inv=[("info", "drone_state")])
         self.controller = controller
@@ -415,7 +416,7 @@ class PIDRateController(Transform):
         self.target_clip = self.controller.target_clip
         self.max_thrust_ratio = self.controller.max_thrust_ratio
         self.min_thrust_ratio = self.controller.min_thrust_ratio
-        # self.tanh = TanhTransform()
+        self.actor_has_tanh = actor_has_tanh
     
     def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
         action_spec = input_spec[("_action_spec", *self.action_key)]
@@ -428,7 +429,12 @@ class PIDRateController(Transform):
         action = tensordict[self.action_key]
         tensordict.set((*self.action_key[:-1], "action_raw"), action.clone())
 
-        action = torch.tanh(action)
+        if self.actor_has_tanh:
+            # Actor uses TanhNormal: output already in (-1, 1). Clamp for safety.
+            action = action.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        else:
+            # Actor uses raw Gaussian: squash here.
+            action = torch.tanh(action)
         # action: [-1, 1]
         target_rate, target_thrust = action.split([3, 1], -1)
 

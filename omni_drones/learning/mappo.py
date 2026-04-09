@@ -874,9 +874,16 @@ class MAPPOPolicy(object):
                 cmd_action = tensordict[self.act_name]
                 train_info["action_norm"] = raw_action.norm(dim=-1).mean().item()
                 train_info["cmd_norm"] = cmd_action.norm(dim=-1).mean().item()
-                train_info["action_squash_sat_frac"] = (
-                    torch.tanh(raw_action).abs() > 0.98
-                ).float().mean().item()
+                if self.cfg.actor.tanh:
+                    # actor already outputs squashed actions in (-1,1)
+                    train_info["action_squash_sat_frac"] = (
+                        raw_action.abs() > 0.98
+                    ).float().mean().item()
+                else:
+                    # actor outputs raw unbounded actions; check post-tanh saturation
+                    train_info["action_squash_sat_frac"] = (
+                        torch.tanh(raw_action).abs() > 0.98
+                    ).float().mean().item()
                 train_info["cmd_saturation_frac"] = (
                     cmd_action.abs() > 0.98
                 ).float().mean().item()
@@ -977,7 +984,13 @@ def make_ppo_actor(cfg, observation_spec: TensorSpec, action_spec: TensorSpec):
     elif isinstance(action_spec, (UnboundedTensorSpec, BoundedTensorSpec)):
         action_dim = action_spec.shape[-1]
         if cfg.tanh:
-            act_dist = TanhIndependentNormalModule(feature_dim, action_dim)
+            act_dist = TanhIndependentNormalModule(
+                feature_dim,
+                action_dim,
+                log_std_init=cfg.get("log_std_init", 0.0),
+                log_std_min=cfg.get("log_std_min", -5.0),
+                log_std_max=cfg.get("log_std_max", 1.0),
+            )
         else:
             act_dist = DiagGaussian(
                 feature_dim,

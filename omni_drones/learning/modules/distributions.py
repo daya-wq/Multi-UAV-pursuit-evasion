@@ -237,14 +237,20 @@ class TanhIndependentNormalModule(nn.Module):
         min: Union[torch.Tensor, Number] = -1.0,
         max: Union[torch.Tensor, Number] = 1.0,
         event_dims=1,
+        log_std_init: float = 0.0,
+        log_std_min: float = -5.0,
+        log_std_max: float = 1.0,
     ):
         super().__init__()
         self.state_dependent_std = state_dependent_std
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
         if self.state_dependent_std:
-            self.operator = nn.Linear(input_dim, output_dim * 2)
+            # NOTE: uses fc_mean for checkpoint compatibility with DiagGaussian
+            self.fc_mean = nn.Linear(input_dim, output_dim * 2)
         else:
-            self.operator = nn.Linear(input_dim, output_dim)
-            self.log_std = nn.Parameter(torch.zeros(output_dim))
+            self.fc_mean = nn.Linear(input_dim, output_dim)
+            self.log_std = nn.Parameter(torch.full((output_dim,), float(log_std_init)))
         if isinstance(scale_mapping, str):
             self.scale_mapping = _mappings[scale_mapping]
         elif callable(self.scale_mapping):
@@ -258,11 +264,12 @@ class TanhIndependentNormalModule(nn.Module):
 
     def forward(self, tensor: torch.Tensor) -> Tuple[torch.Tensor]:
         if self.state_dependent_std:
-            loc, scale = self.operator(tensor).chunk(2, -1)
-            scale = self.scale_mapping(scale) # .clamp_min(self.scale_lb)
+            loc, scale = self.fc_mean(tensor).chunk(2, -1)
+            scale = self.scale_mapping(scale).clamp_min(self.scale_lb)
         else:
-            loc = self.operator(tensor)
-            scale = self.scale_mapping(self.log_std)# .clamp_min(self.scale_lb)
+            loc = self.fc_mean(tensor)
+            log_std_clamped = self.log_std.clamp(self.log_std_min, self.log_std_max)
+            scale = self.scale_mapping(log_std_clamped).clamp_min(self.scale_lb)
         return self.dist_cls(loc, scale)
 
 

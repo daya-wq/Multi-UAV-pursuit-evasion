@@ -44,10 +44,10 @@ actor:
   attn_encoder: CoopEntityAttentionEncoder # self token + teammate entities + local cylinders
   use_orthogonal: true
 
-  tanh: false
-  log_std_init: 0.0
-  log_std_min: -2.0
-  log_std_max: 0.5
+  tanh: true
+  log_std_init: -3.0
+  log_std_min: -5.0
+  log_std_max: -1.0
   bc_aux:
     enabled: false
     hidden_dim: 256
