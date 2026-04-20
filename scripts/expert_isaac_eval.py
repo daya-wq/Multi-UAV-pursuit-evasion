@@ -16,6 +16,8 @@ expert_isaac_eval.py
 用法
 ----
   bash scripts/expert_isaac_eval.sh tp_net 1.5 2 100
+  bash scripts/expert_isaac_eval.sh oracle_pos 1.5 0 512
+  bash scripts/expert_isaac_eval.sh oracle_next 1.5 0 512
 """
 
 import argparse
@@ -38,27 +40,54 @@ from omegaconf import OmegaConf
 # ──────────────────────────────────────────────────────────────
 _extra_parser = argparse.ArgumentParser(add_help=False)
 _extra_parser.add_argument("--pred_mode",   default="tp_net",
-                            choices=["noise", "tp_net"])
+                            choices=["noise", "tp_net", "oracle_pos", "oracle_next"])
+_extra_parser.add_argument("--strategy_variant", default="baseline",
+                            choices=["baseline", "expert2"])
+_extra_parser.add_argument("--forward_dir_mode", default="default",
+                            choices=["default", "motion_biased", "motion_only"])
+_extra_parser.add_argument("--enable_goal_mode", type=lambda x: x.lower() != "false",
+                            default=None)
+_extra_parser.add_argument("--enable_close_mode", type=lambda x: x.lower() != "false",
+                            default=None)
+_extra_parser.add_argument("--enable_rush_mode", type=lambda x: x.lower() != "false",
+                            default=None)
+_extra_parser.add_argument("--expert2_front_layout", default="symmetric",
+                            choices=["symmetric", "staggered"],)
+_extra_parser.add_argument("--expert_intercept_pred_step", type=int, default=5)
+_extra_parser.add_argument("--expert_intercept_use_direct_pred", type=lambda x: x.lower() != "false",
+                            default=False)
 _extra_parser.add_argument("--tp_weight",   default="")
 _extra_parser.add_argument("--n_video",     type=int, default=2)
 _extra_parser.add_argument("--n_generic",   type=int, default=100)
 _extra_parser.add_argument("--v_prey_test", type=float, default=1.5)
+_extra_parser.add_argument("--v_prey_schedule", default="",
+                            help="Comma-separated target-speed schedule cycled across generic waves.")
 _extra_parser.add_argument("--v_drone_test", type=float, default=1.5)
 _extra_parser.add_argument("--video_dir",   default="eval_videos/expert")
 _extra_parser.add_argument("--video_seed_base", type=int, default=0)
+_extra_parser.add_argument("--video_seed_list", default="",
+                            help="Comma-separated explicit seeds for video recording. Overrides n_video/base stepping.")
+_extra_parser.add_argument("--generic_seed_base", type=int, default=999)
 _extra_parser.add_argument("--generic_batch_envs", type=int, default=1,
                             help="Parallel env count for generic no-video evaluation.")
 _extra_parser.add_argument("--random_init", type=lambda x: x.lower() != "false",
                             default=True)
-_extra_parser.add_argument("--episode_length", type=int, default=1000,
+_extra_parser.add_argument("--episode_length", type=int, default=1200,
                             help="Environment episode length / timeout steps.")
-_extra_parser.add_argument("--max_steps",   type=int, default=1000,
+_extra_parser.add_argument("--max_steps",   type=int, default=1200,
                             help="Hard runner cap; should normally match episode_length.")
 _extra_parser.add_argument("--collect_success_dataset", type=lambda x: x.lower() == "true",
                             default=False)
 _extra_parser.add_argument("--dataset_dir", default="expert_datasets")
+_extra_parser.add_argument("--dataset_name", default="")
 _extra_parser.add_argument("--min_success_steps", type=int, default=1)
 _extra_parser.add_argument("--dataset_dtype", default="float16",
+                            choices=["float16", "float32"])
+_extra_parser.add_argument("--collect_tp_dataset", type=lambda x: x.lower() == "true",
+                            default=False)
+_extra_parser.add_argument("--tp_dataset_dir", default="tp_datasets")
+_extra_parser.add_argument("--tp_dataset_name", default="")
+_extra_parser.add_argument("--tp_dataset_dtype", default="float16",
                             choices=["float16", "float32"])
 _extra_args, _remaining_argv = _extra_parser.parse_known_args()
 sys.argv = [sys.argv[0]] + _remaining_argv
@@ -72,6 +101,7 @@ if SCRIPT_DIR not in sys.path:
 from expert_strategy_test import EnvCfg as SharedExpertCfg
 from expert_strategy_test import ExpertPolicy as SharedExpertPolicy
 from expert_strategy_test import TP_net as SharedTPNet
+from expert_strategy_test import apply_strategy_defaults as apply_shared_strategy_defaults
 
 
 # ──────────────────────────────────────────────────────────────
@@ -101,6 +131,16 @@ def safe_atanh(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.atanh(x.clamp(-1.0 + eps, 1.0 - eps))
 
 
+def parse_float_schedule(value: str, default: float):
+    values = []
+    for item in str(value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        values.append(float(item))
+    return values or [float(default)]
+
+
 def project_to_plane(v: torch.Tensor, normal: torch.Tensor) -> torch.Tensor:
     return v - (v * normal).sum(dim=-1, keepdim=True) * normal
 
@@ -121,6 +161,26 @@ def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     b = torch.cross(q_vec, v, dim=-1) * q_w * 2.0
     c = q_vec * (q_vec * v).sum(dim=-1, keepdim=True) * 2.0
     return a - b + c
+
+
+def compute_true_target_next(
+    base_env,
+    target_pos_w: torch.Tensor,
+    target_vel_3: torch.Tensor,
+):
+    """Replicate HideAndSeek target update to get the next-step ground-truth target state."""
+    forces_target = base_env._get_dummy_policy_prey()
+    desired_acc = base_env.target_accel_limit * forces_target / (
+        torch.norm(forces_target, dim=-1, keepdim=True) + 1e-5
+    )
+    accel_alpha = min(1.0, float(base_env.dt) / max(base_env.target_command_tau, float(base_env.dt)))
+    next_target_acc_cmd = torch.lerp(base_env.target_acc_cmd, desired_acc, accel_alpha)
+    next_target_vel = target_vel_3 + (
+        next_target_acc_cmd - base_env.target_velocity_damping * target_vel_3
+    ) * float(base_env.dt)
+    next_target_vel = clip_vector_norm(next_target_vel, float(base_env.current_target_speed))
+    next_target_pos = target_pos_w + next_target_vel * float(base_env.dt)
+    return next_target_pos, next_target_vel
 
 
 # ──────────────────────────────────────────────────────────────
@@ -212,6 +272,10 @@ class ExpertPolicy:
                         tp: torch.Tensor, tv: torch.Tensor) -> torch.Tensor:
         if self.pred_mode == "tp_net" and self.tp is not None:
             return self.tp.predict(tp[0], tv[0])
+        if self.pred_mode == "oracle_pos":
+            return tp[0].clone()
+        if self.pred_mode == "oracle_next":
+            return tp[0] + tv[0] * 0.1
         noise = torch.randn(3, device=tp.device) * self.noise_std
         return tp[0] + tv[0] * 0.1 + noise
 
@@ -358,7 +422,14 @@ class BatchedTPNetPredictor:
             self.history[active, -1] = frame[active]
 
         out = self.net(self.history).reshape(batch_size, self.cfg.future_predcition_step, 3)
-        pred = out[:, 0].clone()
+        pred_idx = max(
+            0,
+            min(
+                int(getattr(self.cfg, "expert_intercept_pred_step", 5)) - 1,
+                int(self.cfg.future_predcition_step) - 1,
+            ),
+        )
+        pred = out[:, pred_idx].clone()
         pred[:, :2] = pred[:, :2] * self.cfg.arena_size
         pred[:, 2] = (pred[:, 2] + 1.0) / 2.0 * self.cfg.max_height
         return pred
@@ -411,6 +482,10 @@ class BatchedExpertPolicy:
             return self.tp_predictor.predict_next_pos_batch(
                 step, target_pos, target_vel, drone_pos
             )
+        if self.pred_mode == "oracle_pos":
+            return target_pos.squeeze(1).clone()
+        if self.pred_mode == "oracle_next":
+            return target_next_pos.squeeze(1).clone()
         batch_size = target_pos.shape[0]
         noise_mag = torch.rand(batch_size, 1, device=target_pos.device, dtype=target_pos.dtype) * 0.5
         direction = torch.randn(batch_size, 3, device=target_pos.device, dtype=target_pos.dtype)
@@ -427,13 +502,15 @@ class BatchedExpertPolicy:
         goal_vec = goal_pos - target_pos
         goal_dist = goal_vec.norm(dim=-1)
         goal_dir = safe_normalize(goal_vec)
-
         lookahead_time = torch.where(
             goal_dist > 1.4,
             torch.full_like(goal_dist, 0.18),
             torch.full_like(goal_dist, 0.10),
         )
-        intercept_seed = target_pos_pred + target_vel * lookahead_time.unsqueeze(-1)
+        if bool(getattr(self.cfg, "expert_intercept_use_direct_pred", False)):
+            intercept_seed = target_pos_pred
+        else:
+            intercept_seed = target_pos_pred + target_vel * lookahead_time.unsqueeze(-1)
 
         motion_hint = target_vel.clone()
         motion_norm = motion_hint.norm(dim=-1)
@@ -450,7 +527,54 @@ class BatchedExpertPolicy:
             motion_hint,
         )
         motion_dir = safe_normalize(motion_hint)
-        forward_dir = safe_normalize(0.7 * goal_dir + 0.3 * motion_dir)
+
+        trap_mode = goal_dist < 1.55
+        goal_emergency = goal_dist < 1.10
+        if self.cfg.strategy_variant == "expert2" and not bool(self.cfg.enable_goal_mode):
+            goal_emergency = torch.zeros_like(goal_emergency, dtype=torch.bool)
+
+        if self.cfg.strategy_variant == "expert2" and not bool(self.cfg.enable_goal_mode):
+            forward_dir = motion_dir
+        elif self.cfg.forward_dir_mode == "motion_only":
+            forward_dir = motion_dir
+        else:
+            if self.cfg.forward_dir_mode == "motion_biased":
+                if self.cfg.strategy_variant == "expert2":
+                    goal_weight = torch.where(
+                        goal_emergency,
+                        torch.full_like(goal_dist, 0.80),
+                        torch.full_like(goal_dist, 0.45),
+                    )
+                else:
+                    goal_weight = torch.where(
+                        goal_emergency,
+                        torch.full_like(goal_dist, 0.80),
+                        torch.where(
+                            trap_mode,
+                            torch.full_like(goal_dist, 0.60),
+                            torch.full_like(goal_dist, 0.45),
+                        ),
+                    )
+            else:
+                if self.cfg.strategy_variant == "expert2":
+                    goal_weight = torch.where(
+                        goal_emergency,
+                        torch.full_like(goal_dist, 0.92),
+                        torch.full_like(goal_dist, 0.70),
+                    )
+                else:
+                    goal_weight = torch.where(
+                        goal_emergency,
+                        torch.full_like(goal_dist, 0.92),
+                        torch.where(
+                            trap_mode,
+                            torch.full_like(goal_dist, 0.80),
+                            torch.full_like(goal_dist, 0.70),
+                        ),
+                    )
+            forward_dir = safe_normalize(
+                goal_weight.unsqueeze(-1) * goal_dir + (1 - goal_weight).unsqueeze(-1) * motion_dir
+            )
 
         up = torch.tensor([0.0, 0.0, 1.0], device=target_pos.device, dtype=target_pos.dtype).expand_as(forward_dir)
         lateral = torch.linalg.cross(up, forward_dir)
@@ -460,9 +584,27 @@ class BatchedExpertPolicy:
             lateral,
         )
         lateral = safe_normalize(lateral)
+        if self.cfg.strategy_variant == "expert2":
+            rear_offset = torch.where(
+                goal_emergency,
+                torch.zeros_like(goal_dist),
+                torch.full_like(goal_dist, -float(self.cfg.expert2_rear_back)),
+            )
+            rear = intercept_seed + forward_dir * rear_offset.unsqueeze(-1)
+            if self.cfg.expert2_front_layout == "staggered":
+                left = intercept_seed
+                right = (
+                    intercept_seed
+                    + forward_dir * float(self.cfg.expert2_front_lead_forward)
+                    + lateral * float(self.cfg.expert2_front_lead_side)
+                )
+            else:
+                left = intercept_seed + lateral * float(self.cfg.expert2_side_width)
+                right = intercept_seed - lateral * float(self.cfg.expert2_side_width)
+            anchors = torch.stack([rear, left, right], dim=1)
+            trap_mode = torch.zeros_like(goal_dist, dtype=torch.bool)
+            return anchors, forward_dir, trap_mode
 
-        trap_mode = goal_dist < 1.55
-        goal_emergency = goal_dist < 1.10
         front_cap = torch.clamp(goal_dist - self.cfg.goal_region_radius - 0.12, min=0.45)
         base_front = torch.minimum(
             front_cap,
@@ -535,11 +677,13 @@ class BatchedExpertPolicy:
 
         vel_error = desired_vel - current_vel
         acc_cmd = 3.2 * vel_error
-        acc_cmd[:, :2] = clip_vector_norm_per_row(
-            acc_cmd[:, :2],
-            torch.full((desired_vel.shape[0],), 4.2, device=desired_vel.device, dtype=desired_vel.dtype),
-        )
+        # Clamp z first, then couple xy limit to max tilt angle
         acc_cmd[:, 2] = acc_cmd[:, 2].clamp(-3.5, 3.5)
+        # Coupled xy limit: ||a_xy|| ≤ (g + a_z) * tan(θ_max)
+        # Ensures thrust direction never exceeds θ_max tilt
+        max_tilt_tan = math.tan(math.radians(25))  # θ_max = 25°
+        a_xy_max = ((self.cfg.gravity + acc_cmd[:, 2]) * max_tilt_tan).clamp(min=0.1)
+        acc_cmd[:, :2] = clip_vector_norm_per_row(acc_cmd[:, :2], a_xy_max)
 
         e3 = torch.tensor([0.0, 0.0, 1.0], device=desired_vel.device, dtype=desired_vel.dtype).unsqueeze(0)
         thrust_world = acc_cmd + self.cfg.gravity * e3
@@ -581,13 +725,13 @@ class BatchedExpertPolicy:
             + torch.linalg.cross(y_cur, y_des)
             + torch.linalg.cross(z_cur, z_des)
         )
-        omega_world = 2.7 * e_rot
+        omega_world = 2.0 * e_rot
         omega_body = quat_rotate_inverse(current_quat, omega_world)
         omega_body = clip_vector_norm_per_row(
             omega_body,
             torch.full(
                 (desired_vel.shape[0],),
-                0.85 * self.cfg.max_body_rate_rad_s,
+                0.65 * self.cfg.max_body_rate_rad_s,
                 device=desired_vel.device,
                 dtype=desired_vel.dtype,
             ),
@@ -607,9 +751,17 @@ class BatchedExpertPolicy:
         t: torch.Tensor,
         omega: torch.Tensor,
     ) -> torch.Tensor:
+        action = self.t_omega_to_pidrate_action(t, omega)
+        return safe_atanh(action)
+
+    def t_omega_to_pidrate_action(
+        self,
+        t: torch.Tensor,
+        omega: torch.Tensor,
+    ) -> torch.Tensor:
         rate_norm = (omega / max(self.cfg.max_body_rate_rad_s, 1e-6)).clamp(-0.999, 0.999)
         thrust_norm = (2.0 * t - 1.0).clamp(-0.999, 0.999).unsqueeze(-1)
-        return safe_atanh(torch.cat([rate_norm, thrust_norm], dim=-1))
+        return torch.cat([rate_norm, thrust_norm], dim=-1)
 
     @torch.no_grad()
     def get_actions_batch(
@@ -636,10 +788,16 @@ class BatchedExpertPolicy:
         )
         assignment = self._assign_anchors_batch(drone_pos, anchors)
 
-        min_target_dist = torch.norm(
+        dist_to_target_all = torch.norm(
             drone_pos - target_pos_flat.unsqueeze(1), dim=-1
-        ).min(dim=-1).values
+        )  # [batch, n_agents]
+        min_target_dist = dist_to_target_all.min(dim=-1).values  # [batch]
         goal_dist = torch.norm(goal_pos - target_pos_flat, dim=-1)
+        rush_idx = dist_to_target_all.argmin(dim=-1)  # [batch] index of closest drone
+        if bool(self.cfg.enable_rush_mode):
+            rush_mode = min_target_dist < self.cfg.catch_radius * 1.8
+        else:
+            rush_mode = torch.zeros_like(min_target_dist, dtype=torch.bool)
 
         t_list = []
         omega_list = []
@@ -648,6 +806,8 @@ class BatchedExpertPolicy:
         batch_idx = torch.arange(batch_size, device=drone_pos.device)
 
         for agent_idx in range(n_agents):
+            is_rush_agent = rush_mode & (rush_idx == agent_idx)  # [batch] bool
+
             anchor_idx = assignment[:, agent_idx]
             waypoint = anchors[batch_idx, anchor_idx]
             pos_i = drone_pos[:, agent_idx]
@@ -656,13 +816,42 @@ class BatchedExpertPolicy:
             to_wp = waypoint - pos_i
             dist_wp = to_wp.norm(dim=-1)
 
-            forward_bias = torch.where(anchor_idx == 0, 0.22, -0.05).to(to_wp.dtype)
-            feedforward = target_vel_flat + forward_bias.unsqueeze(-1) * forward_dir
-            kp = torch.where(anchor_idx == 0, 1.90, 1.65).to(to_wp.dtype)
-            kp = kp + trap_mode.to(to_wp.dtype) * 0.20
+            is_expert2 = self.cfg.strategy_variant == "expert2"
+            is_chaser = is_expert2 & (anchor_idx == 0)
+            is_front_interceptor = is_expert2 & (anchor_idx != 0)
+
+            # ── Normal formation logic ──
+            if self.cfg.strategy_variant == "expert2":
+                forward_bias = torch.where(
+                    is_chaser,
+                    torch.full_like(dist_wp, -0.08),
+                    torch.full_like(dist_wp, 0.10),
+                ).to(to_wp.dtype)
+                feedforward = target_vel_flat + forward_bias.unsqueeze(-1) * forward_dir
+                kp = torch.where(
+                    is_chaser,
+                    torch.full_like(dist_wp, 1.70),
+                    torch.full_like(dist_wp, 1.80),
+                ).to(to_wp.dtype)
+            else:
+                forward_bias = torch.where(anchor_idx == 0, 0.22, -0.05).to(to_wp.dtype)
+                feedforward = target_vel_flat + forward_bias.unsqueeze(-1) * forward_dir
+                kp = torch.where(anchor_idx == 0, 1.90, 1.65).to(to_wp.dtype)
+                kp = kp + trap_mode.to(to_wp.dtype) * 0.20
             v_des = kp.unsqueeze(-1) * to_wp + 0.85 * feedforward - 0.26 * vel_i
 
-            close_mode = (dist_wp < 0.45) | (min_target_dist < 0.95)
+            if bool(self.cfg.enable_close_mode):
+                if self.cfg.strategy_variant == "expert2":
+                    target_close_threshold = torch.where(
+                        is_chaser,
+                        torch.full_like(dist_wp, float(self.cfg.expert2_chaser_close_target_threshold)),
+                        torch.full_like(dist_wp, float(self.cfg.expert2_front_close_target_threshold)),
+                    )
+                    close_mode = (dist_wp < 0.45) | (dist_to_target_all[:, agent_idx] < target_close_threshold)
+                else:
+                    close_mode = (dist_wp < 0.45) | (min_target_dist < 0.95)
+            else:
+                close_mode = torch.zeros_like(dist_wp, dtype=torch.bool)
             desired_height = target_pos_pred[:, 2] + torch.where(
                 close_mode,
                 torch.full_like(dist_wp, 0.10),
@@ -671,11 +860,12 @@ class BatchedExpertPolicy:
             desired_height = desired_height.clamp(1.2, self.cfg.max_height - 0.4)
             v_des[:, 2] = 0.90 * (desired_height - pos_i[:, 2]) - 0.45 * vel_i[:, 2]
 
-            frontal_mask = (goal_dist < 1.4) & (anchor_idx == 0) & (dist_wp > 0.45)
-            frontal_wp = target_pos_pred + 0.95 * forward_dir
-            v_frontal = 1.60 * (frontal_wp - pos_i) + 0.70 * feedforward - 0.35 * vel_i
-            v_frontal[:, 2] = 0.95 * (desired_height - pos_i[:, 2]) - 0.45 * vel_i[:, 2]
-            v_des = torch.where(frontal_mask.unsqueeze(-1), v_frontal, v_des)
+            if self.cfg.strategy_variant != "expert2":
+                frontal_wp = target_pos_pred + 0.95 * forward_dir
+                v_frontal = 1.60 * (frontal_wp - pos_i) + 0.70 * feedforward - 0.35 * vel_i
+                v_frontal[:, 2] = 0.95 * (desired_height - pos_i[:, 2]) - 0.45 * vel_i[:, 2]
+                frontal_mask = (goal_dist < 1.4) & (anchor_idx == 0) & (dist_wp > 0.45)
+                v_des = torch.where(frontal_mask.unsqueeze(-1), v_frontal, v_des)
 
             side_axis = project_to_plane(waypoint - target_pos_flat, forward_dir)
             side_axis = torch.where(
@@ -683,23 +873,44 @@ class BatchedExpertPolicy:
                 safe_normalize(side_axis),
                 torch.zeros_like(side_axis),
             )
-            close_wp_block = target_pos_pred + 0.03 * forward_dir
-            close_wp_flank = (
-                target_pos_pred
-                - 0.03 * forward_dir
-                + side_axis
-                * torch.where(
-                    trap_mode,
-                    torch.full_like(goal_dist, 0.12),
-                    torch.full_like(goal_dist, 0.18),
-                ).unsqueeze(-1)
-            )
-            close_wp = torch.where(
-                (anchor_idx == 0).unsqueeze(-1),
-                close_wp_block,
-                close_wp_flank,
-            )
-            inward_gain = torch.where(anchor_idx == 0, 0.18, 0.10).to(to_wp.dtype)
+            if self.cfg.strategy_variant == "expert2":
+                close_wp_chaser = target_pos_pred - float(self.cfg.expert2_chaser_close_back) * forward_dir
+                close_wp_interceptor = (
+                    target_pos_pred
+                    + float(self.cfg.expert2_front_close_forward) * forward_dir
+                    + side_axis * float(self.cfg.expert2_front_close_side)
+                )
+                close_wp = torch.where(
+                    is_chaser.unsqueeze(-1),
+                    close_wp_chaser,
+                    close_wp_interceptor,
+                )
+                inward_gain = torch.where(
+                    is_chaser,
+                    torch.full_like(dist_wp, float(self.cfg.expert2_chaser_inward_gain)),
+                    torch.full_like(dist_wp, float(self.cfg.expert2_front_inward_gain)),
+                ).to(to_wp.dtype)
+            else:
+                close_wp_block = target_pos_pred + 0.03 * forward_dir
+                close_wp_flank = (
+                    target_pos_pred
+                    - 0.03 * forward_dir
+                    + side_axis
+                    * torch.where(
+                        trap_mode,
+                        torch.full_like(goal_dist, 0.12),
+                        torch.full_like(goal_dist, 0.18),
+                    ).unsqueeze(-1)
+                )
+                close_wp = torch.where(
+                    (anchor_idx == 0).unsqueeze(-1),
+                    close_wp_block,
+                    close_wp_flank,
+                )
+                inward_gain = torch.where(anchor_idx == 0, 0.18, 0.10).to(to_wp.dtype)
+            rush_close_wp = target_pos_pred.clone()
+            close_wp = torch.where(is_rush_agent.unsqueeze(-1), rush_close_wp, close_wp)
+            inward_gain = torch.where(is_rush_agent, 0.35, inward_gain)
             inward = safe_normalize(target_pos_pred - pos_i)
             v_close = (
                 2.05 * (close_wp - pos_i)
@@ -710,18 +921,66 @@ class BatchedExpertPolicy:
             v_close[:, 2] = 0.90 * (target_pos_pred[:, 2] - pos_i[:, 2]) - 0.55 * vel_i[:, 2]
             v_des = torch.where(close_mode.unsqueeze(-1), v_close, v_des)
 
-            speed_cap = torch.where(
-                (~close_mode) | (anchor_idx == 0),
-                torch.full_like(dist_wp, self.cfg.v_drone),
-                torch.full_like(dist_wp, 0.96 * self.cfg.v_drone),
-            )
-            v_des = clip_vector_norm_per_row(v_des, speed_cap)
+            # Speed cap: all drones use full v_drone (removed 0.96 flanker cap)
+            v_des = clip_vector_norm_per_row(v_des, self.cfg.v_drone)
+
+            # ── Drone-Drone collision avoidance (repulsive velocity correction) ──
+            safe_dist = torch.full_like(dist_wp, 4.0 * self.cfg.collision_radius)
+            repulse_gain = torch.full_like(dist_wp, 0.5)
+            if self.cfg.strategy_variant == "expert2":
+                safe_dist = torch.where(
+                    close_mode,
+                    torch.full_like(dist_wp, float(self.cfg.expert2_close_safe_dist)),
+                    safe_dist,
+                )
+                repulse_gain = torch.where(
+                    close_mode,
+                    torch.full_like(dist_wp, float(self.cfg.expert2_close_repulse_gain)),
+                    repulse_gain,
+                )
+            for other_idx in range(n_agents):
+                if other_idx == agent_idx:
+                    continue
+                sep = pos_i - drone_pos[:, other_idx]  # [batch, 3]
+                d = sep.norm(dim=-1)  # [batch]
+                too_close = d < safe_dist
+                if not bool(too_close.any()):
+                    continue
+                repulse_dir = safe_normalize(sep)
+                repulse_mag = self.cfg.v_drone * repulse_gain * (1.0 - d / safe_dist.clamp(min=1e-6))
+                repulse_mag = repulse_mag.clamp(min=0.0)
+                if self.cfg.strategy_variant == "expert2":
+                    rel_vel = vel_i - drone_vel[:, other_idx]
+                    closing_speed = (-(rel_vel * repulse_dir).sum(dim=-1)).clamp(min=0.0)
+                    closing_boost = 1.0 + float(self.cfg.expert2_close_repulse_closing_boost) * torch.clamp(
+                        closing_speed / max(self.cfg.v_drone, 1e-6), min=0.0, max=1.0
+                    )
+                    repulse_mag = torch.where(close_mode, repulse_mag * closing_boost, repulse_mag)
+                v_des = v_des + (too_close.float() * repulse_mag).unsqueeze(-1) * repulse_dir
+                v_des = clip_vector_norm_per_row(v_des, self.cfg.v_drone)
+
+            # ── Universal floor guard: prevent ground contact ──
+            # Escalate to a guaranteed climb inside the low-altitude band.
+            floor_safe_z = self.cfg.low_altitude_guard_z
+            cur_z = pos_i[:, 2]  # [batch]
+            low_mask = cur_z < floor_safe_z
+            if bool(low_mask.any()):
+                floor_correction = 3.0 * (floor_safe_z - cur_z)
+                v_des[:, 2] = torch.where(
+                    low_mask,
+                    torch.max(v_des[:, 2], floor_correction),
+                    v_des[:, 2],
+                )
+                v_des = clip_vector_norm_per_row(v_des, self.cfg.v_drone)
+
+            # ── heading hint: rush drone looks at target, others look at waypoint ──
+            heading_hint = torch.where(is_rush_agent.unsqueeze(-1), target_pos_pred - pos_i, to_wp)
 
             ti, oi, vi = self._vel_to_t_omega_batch(
                 v_des,
                 vel_i,
                 quat_i,
-                to_wp,
+                heading_hint,
             )
             t_list.append(ti)
             omega_list.append(oi)
@@ -839,6 +1098,100 @@ def _obs_to_storage_dict(obs_td, dtype: torch.dtype):
     return stored
 
 
+def _extract_env_aligned_aux_from_obs(obs_td, future_steps: int = 5):
+    """Build auxiliary labels directly from env observation tensors."""
+    state_self = obs_td["state_self"].squeeze(-2)       # [N, A, 23]
+    cooperation = obs_td["cooperation"].squeeze(-2)     # [N, A, C]
+
+    assigned_wp = state_self[..., 13:16]
+    close_wp = state_self[..., 16:19]
+    close_trigger = state_self[..., 19:20] > 0.5
+    active_wp = torch.where(close_trigger, close_wp, assigned_wp)
+
+    role_onehot = state_self[..., 20:23]
+    assignment = role_onehot.argmax(dim=-1).to(torch.long)
+
+    pred_start = 3 + max(0, int(future_steps) - 1) * 3
+    pred_end = pred_start + 3
+    target_pos_pred = cooperation[..., pred_start:pred_end][:, 0, :]
+    forward_dir = cooperation[..., 18:21][:, 0, :]
+    trap_mode = torch.zeros(
+        state_self.shape[0], dtype=torch.bool, device=state_self.device
+    )
+
+    return {
+        "assignment": assignment,
+        "waypoint": active_wp,
+        "target_pos_pred": target_pos_pred,
+        "forward_dir": forward_dir,
+        "trap_mode": trap_mode,
+    }
+
+
+def _build_tp_dataset_chunk(
+    tp_input_steps,
+    tp_groundtruth_steps,
+    tp_done_steps,
+    env_done_steps,
+    *,
+    future_step: int,
+    window_step: int,
+    storage_dtype: torch.dtype,
+):
+    if not tp_input_steps or not tp_groundtruth_steps:
+        return None
+
+    tp_inputs = torch.stack(tp_input_steps, dim=1)  # [N, T, H, D]
+    tp_groundtruth = torch.stack(tp_groundtruth_steps, dim=1)  # [N, T, 3]
+    tp_done = torch.stack(tp_done_steps, dim=1).reshape(tp_inputs.shape[0], -1).bool()
+    env_done = torch.stack(env_done_steps, dim=1).reshape(tp_inputs.shape[0], -1).bool()
+
+    total_steps = int(tp_groundtruth.shape[1])
+    if total_steps <= int(future_step):
+        return {
+            "TP_input": torch.empty(
+                0,
+                tp_inputs.shape[2],
+                tp_inputs.shape[3],
+                dtype=storage_dtype,
+            ),
+            "TP_future": torch.empty(0, future_step, tp_groundtruth.shape[-1], dtype=storage_dtype),
+            "num_samples": 0,
+            "episode_steps": total_steps,
+        }
+
+    windows = (
+        tp_groundtruth.unfold(dimension=1, size=future_step + 1, step=window_step)
+        .transpose(2, 3)[:, :, 1:]
+    )
+    window_count = int(windows.shape[1])
+
+    timeout_valid = tp_done[:, :window_count]
+    continuity_windows = env_done.unfold(
+        dimension=1, size=future_step, step=window_step
+    )[:, :window_count]
+    continuity_valid = ~continuity_windows.any(dim=-1)
+    valid_windows = timeout_valid & continuity_valid
+
+    flat_mask = valid_windows.reshape(-1)
+    flat_inputs = tp_inputs[:, :window_count].reshape(-1, *tp_inputs.shape[2:])
+    flat_windows = windows.reshape(-1, future_step, tp_groundtruth.shape[-1])
+
+    selected_inputs = flat_inputs[flat_mask].detach().cpu()
+    selected_windows = flat_windows[flat_mask].detach().cpu()
+    if torch.is_floating_point(selected_inputs):
+        selected_inputs = selected_inputs.to(storage_dtype)
+    if torch.is_floating_point(selected_windows):
+        selected_windows = selected_windows.to(storage_dtype)
+
+    return {
+        "TP_input": selected_inputs.contiguous(),
+        "TP_future": selected_windows.contiguous(),
+        "num_samples": int(selected_inputs.shape[0]),
+        "episode_steps": total_steps,
+    }
+
+
 def _stats_scalar(stats, key: str, env_idx: int, default: float = float("nan")) -> float:
     try:
         value = stats[key][env_idx]
@@ -856,11 +1209,25 @@ def _hover_pidrate_action(expert, n_agents: int, device: torch.device) -> torch.
         device=device,
     )
     omega_cmd = torch.zeros(n_agents, 3, device=device)
-    return expert.t_omega_to_pidrate_raw(
-        t_cmd,
-        omega_cmd,
-        max_body_rate_rad_s=expert.cfg.max_body_rate_rad_s,
-    )
+    return _expert_to_pidrate_action(expert, t_cmd, omega_cmd)
+
+
+def _expert_to_pidrate_action(
+    expert,
+    t_cmd: torch.Tensor,
+    omega_cmd: torch.Tensor,
+) -> torch.Tensor:
+    try:
+        return expert.t_omega_to_pidrate_action(
+            t_cmd,
+            omega_cmd,
+        )
+    except TypeError:
+        return expert.t_omega_to_pidrate_action(
+            t_cmd,
+            omega_cmd,
+            max_body_rate_rad_s=float(expert.cfg.max_body_rate_rad_s),
+        )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -878,9 +1245,9 @@ def run_episode(env, base_env, expert,
       - thrust: [-1,1], where 0 ≈ hover
 
     Expert outputs thrust ratio `t` plus body-rate command `omega`.
-    We convert that to the raw action expected by the training-time
-    PIDRate transform, so the pursuers use the same 6DoF dynamics path
-    as RL training.
+    We convert that to the same normalized PIDRate action space used by
+    the current tanh actor, so the pursuers use the same 6DoF dynamics
+    path and the same action semantics as RL training.
 
     dt = 0.01 s (sim_base.yaml).  max_steps=1300 → 13 s per episode.
     """
@@ -895,6 +1262,9 @@ def run_episode(env, base_env, expert,
     v_max      = float(base_env.cfg.task.v_drone)
     min_target_dist_seen = float("inf")
     min_goal_dist_seen = float("inf")
+    expert_pred_error_pos_sum = 0.0
+    expert_pred_error_next_sum = 0.0
+    expert_pred_error_steps = 0
 
     def _scalar(stats, key, default=float("nan")):
         try:
@@ -914,37 +1284,59 @@ def run_episode(env, base_env, expert,
         dp = drone_pos_w[0]    # [n_agents, 3]
         dq = drone_quat_w[0]   # [n_agents, 4]
         dv = drone_vel_3[0]    # [n_agents, 3]
-        tp = target_pos_w[0]   # [1, 3]
-        tv = target_vel_3[0]   # [1, 3]
+        tp = target_pos_w[0].reshape(-1, 3)[:1]   # [1, 3]
+        tv = target_vel_3[0].reshape(-1, 3)[:1]   # [1, 3]
         target_dist_now = torch.norm(dp - tp[0], dim=-1).min().item()
         goal_dist_now = torch.norm(tp[0, :2] - base_env.goal_region_center[:2]).item()
         min_target_dist_seen = min(min_target_dist_seen, target_dist_now)
         min_goal_dist_seen = min(min_goal_dist_seen, goal_dist_now)
 
         # ── expert: thrust ratio + body-rate command ─────────
-        target_next_pos = tp + tv * dt
+        target_next_pos, _ = compute_true_target_next(base_env, tp, tv)
+        target_next_pos = target_next_pos.reshape(-1, 3)[:1]
         try:
-            t_cmd, omega_cmd, vel_cmd = expert.get_actions(
-                step=step_count,
-                drone_pos=dp,
-                drone_vel=dv,
-                target_pos=tp,
-                target_vel=tv,
-                target_next_pos=target_next_pos,
-                drone_quat=dq,
-            )
+            if hasattr(expert, "get_actions_batch"):
+                t_cmd_b, omega_cmd_b, vel_cmd_b, expert_debug = expert.get_actions_batch(
+                    step=step_count,
+                    drone_pos=dp.unsqueeze(0),
+                    drone_vel=dv.unsqueeze(0),
+                    target_pos=tp.unsqueeze(0),
+                    target_vel=tv.unsqueeze(0),
+                    target_next_pos=target_next_pos.unsqueeze(0),
+                    drone_quat=dq.unsqueeze(0),
+                    return_debug=True,
+                )
+                t_cmd = t_cmd_b.squeeze(0)
+                omega_cmd = omega_cmd_b.squeeze(0)
+                vel_cmd = vel_cmd_b.squeeze(0)
+                pred_pos_debug = expert_debug["target_pos_pred"][0]
+            else:
+                t_cmd, omega_cmd, vel_cmd, expert_debug = expert.get_actions(
+                    step=step_count,
+                    drone_pos=dp,
+                    drone_vel=dv,
+                    target_pos=tp,
+                    target_vel=tv,
+                    target_next_pos=target_next_pos,
+                    drone_quat=dq,
+                    return_debug=True,
+                )
+                pred_pos_debug = expert_debug["target_pos_pred"]
+            expert_pred_error_pos_sum += torch.norm(
+                pred_pos_debug - tp[0]
+            ).item()
+            expert_pred_error_next_sum += torch.norm(
+                pred_pos_debug - target_next_pos[0]
+            ).item()
+            expert_pred_error_steps += 1
         except Exception as e:
             logging.warning(f"Expert error at step {step_count}: {e}")
             t_cmd = torch.full((n_agents,), expert.cfg.hover_thrust_ratio, device=device)
             omega_cmd = torch.zeros(n_agents, 3, device=device)
             vel_cmd = torch.zeros(n_agents, 3, device=device)
 
-        # ── convert (t, omega) → raw PIDrate action ───────────
-        pidrate_action = expert.t_omega_to_pidrate_raw(
-            t_cmd,
-            omega_cmd,
-            max_body_rate_rad_s=expert.cfg.max_body_rate_rad_s,
-        )
+        # ── convert (t, omega) → normalized PIDrate action ────
+        pidrate_action = _expert_to_pidrate_action(expert, t_cmd, omega_cmd)
 
         # expand to [n_envs, n_agents, 4] (only env 0 matters)
         action_batch = pidrate_action.unsqueeze(0).expand(
@@ -991,6 +1383,12 @@ def run_episode(env, base_env, expert,
                 "capture_progress_reward": _scalar(stats, "capture_progress_reward"),
                 "collision": _scalar(stats, "collision"),
                 "target_predicted_error": _scalar(stats, "target_predicted_error"),
+                "expert_pred_error_pos_mean": (
+                    expert_pred_error_pos_sum / max(expert_pred_error_steps, 1)
+                ),
+                "expert_pred_error_next_mean": (
+                    expert_pred_error_next_sum / max(expert_pred_error_steps, 1)
+                ),
             }
             done_flag = True
 
@@ -1020,6 +1418,12 @@ def run_episode(env, base_env, expert,
             "capture_progress_reward": float("nan"),
             "collision": float("nan"),
             "target_predicted_error": float("nan"),
+            "expert_pred_error_pos_mean": (
+                expert_pred_error_pos_sum / max(expert_pred_error_steps, 1)
+            ),
+            "expert_pred_error_next_mean": (
+                expert_pred_error_next_sum / max(expert_pred_error_steps, 1)
+            ),
         }
 
     return frames, ep_info
@@ -1034,6 +1438,8 @@ def run_episode_batch(
     collect_success_dataset: bool = False,
     storage_dtype: torch.dtype = torch.float16,
     min_success_steps: int = 1,
+    collect_tp_dataset: bool = False,
+    tp_storage_dtype: torch.dtype = torch.float16,
 ):
     """
     Run one batched wave of episodes in parallel.
@@ -1050,18 +1456,28 @@ def run_episode_batch(
     results = [None for _ in range(n_envs)]
     min_target_dist_seen = [float("inf")] * n_envs
     min_goal_dist_seen = [float("inf")] * n_envs
+    expert_pred_error_pos_sum = torch.zeros(n_envs, device=device)
+    expert_pred_error_next_sum = torch.zeros(n_envs, device=device)
+    expert_pred_error_count = torch.zeros(n_envs, device=device)
     obs_step_buffer = [] if collect_success_dataset else None
+    prev_action_step_buffer = [] if collect_success_dataset else None
     action_step_buffer = [] if collect_success_dataset else None
     aux_step_buffer = [] if collect_success_dataset else None
+    tp_input_step_buffer = [] if collect_tp_dataset else None
+    tp_groundtruth_step_buffer = [] if collect_tp_dataset else None
+    tp_done_step_buffer = [] if collect_tp_dataset else None
+    env_done_step_buffer = [] if collect_tp_dataset else None
     expert.reset(n_envs)
-    hover_action = expert.t_omega_to_pidrate_raw(
+    hover_action = _expert_to_pidrate_action(
+        expert,
         torch.full(
             (n_envs, n_agents),
             float(expert.cfg.hover_thrust_ratio),
             device=device,
         ).reshape(-1),
         torch.zeros(n_envs * n_agents, 3, device=device),
-    ).reshape(n_envs, n_agents, 4)
+        ).reshape(n_envs, n_agents, 4)
+    prev_action_batch = torch.zeros(n_envs, n_agents, 4, device=device, dtype=torch.float32)
 
     for step_count in range(max_steps):
         drone_pos_w, drone_quat_w = base_env.get_env_poses(base_env.drone.get_world_poses())
@@ -1089,8 +1505,17 @@ def run_episode_batch(
                     storage_dtype,
                 )
             )
+            prev_action_step_buffer.append(
+                prev_action_batch.detach().cpu().to(storage_dtype).contiguous()
+            )
+            env_aux = _extract_env_aligned_aux_from_obs(
+                tensordict[("agents", "observation")],
+                future_steps=int(getattr(base_env, "future_predcition_step", 5)),
+            )
+        else:
+            env_aux = None
 
-        target_next_pos = target_pos_w + target_vel_3 * float(base_env.dt)
+        target_next_pos, _ = compute_true_target_next(base_env, target_pos_w, target_vel_3)
         try:
             expert_out = expert.get_actions_batch(
                 step=step_count,
@@ -1100,28 +1525,36 @@ def run_episode_batch(
                 target_vel=target_vel_3,
                 target_next_pos=target_next_pos,
                 drone_quat=drone_quat_w,
-                return_debug=bool(collect_success_dataset),
+                return_debug=True,
             )
-            if collect_success_dataset:
-                t_cmd, omega_cmd, vel_cmd_expert, expert_debug = expert_out
-            else:
-                t_cmd, omega_cmd, vel_cmd_expert = expert_out
-            action_batch = expert.t_omega_to_pidrate_raw(
+            t_cmd, omega_cmd, vel_cmd_expert, expert_debug = expert_out
+            action_batch = _expert_to_pidrate_action(
+                expert,
                 t_cmd.reshape(-1),
                 omega_cmd.reshape(-1, 3),
             ).reshape(n_envs, n_agents, 4)
+            active_mask = ~done_mask
+            if bool(active_mask.any()):
+                pred_pos_err = torch.norm(
+                    expert_debug["target_pos_pred"] - target_pos_w.squeeze(1), dim=-1
+                )
+                pred_next_err = torch.norm(
+                    expert_debug["target_pos_pred"] - target_next_pos.squeeze(1), dim=-1
+                )
+                expert_pred_error_pos_sum[active_mask] += pred_pos_err[active_mask]
+                expert_pred_error_next_sum[active_mask] += pred_next_err[active_mask]
+                expert_pred_error_count[active_mask] += 1
         except Exception as exc:
             logging.warning(f"Batched expert error at step {step_count}: {exc}")
             action_batch = hover_action.clone()
-            if collect_success_dataset:
-                vel_cmd_expert = torch.zeros(n_envs, n_agents, 3, device=device)
-                expert_debug = {
-                    "assignment": torch.zeros(n_envs, n_agents, dtype=torch.long, device=device),
-                    "waypoint": torch.zeros(n_envs, n_agents, 3, device=device),
-                    "target_pos_pred": torch.zeros(n_envs, 3, device=device),
-                    "forward_dir": torch.zeros(n_envs, 3, device=device),
-                    "trap_mode": torch.zeros(n_envs, dtype=torch.bool, device=device),
-                }
+            vel_cmd_expert = torch.zeros(n_envs, n_agents, 3, device=device)
+            expert_debug = {
+                "assignment": torch.zeros(n_envs, n_agents, dtype=torch.long, device=device),
+                "waypoint": torch.zeros(n_envs, n_agents, 3, device=device),
+                "target_pos_pred": torch.zeros(n_envs, 3, device=device),
+                "forward_dir": torch.zeros(n_envs, 3, device=device),
+                "trap_mode": torch.zeros(n_envs, dtype=torch.bool, device=device),
+            }
 
         if bool(done_mask.any()):
             action_batch[done_mask] = hover_action[done_mask]
@@ -1140,19 +1573,35 @@ def run_episode_batch(
             aux_step_buffer.append(
                 {
                     "vel_cmd": vel_cmd_expert.detach().cpu().to(storage_dtype).contiguous(),
-                    "assignment": expert_debug["assignment"].detach().cpu().to(torch.int16).contiguous(),
-                    "waypoint": expert_debug["waypoint"].detach().cpu().to(storage_dtype).contiguous(),
-                    "target_pos_pred": expert_debug["target_pos_pred"].detach().cpu().to(storage_dtype).contiguous(),
-                    "forward_dir": expert_debug["forward_dir"].detach().cpu().to(storage_dtype).contiguous(),
-                    "trap_mode": expert_debug["trap_mode"].detach().cpu().to(torch.bool).contiguous(),
+                    "assignment": env_aux["assignment"].detach().cpu().to(torch.int16).contiguous(),
+                    "waypoint": env_aux["waypoint"].detach().cpu().to(storage_dtype).contiguous(),
+                    "target_pos_pred": env_aux["target_pos_pred"].detach().cpu().to(storage_dtype).contiguous(),
+                    "forward_dir": env_aux["forward_dir"].detach().cpu().to(storage_dtype).contiguous(),
+                    "trap_mode": env_aux["trap_mode"].detach().cpu().to(torch.bool).contiguous(),
                 }
             )
 
         tensordict["agents", "action"] = action_batch
+        prev_action_batch = action_batch.detach().clone()
         tensordict = env.step(tensordict)
         td_next = tensordict.get("next")
         done_vec = td_next.get("done").reshape(n_envs).bool()
         stats = td_next.get("stats")
+
+        if collect_tp_dataset:
+            tp_td = td_next["agents"]["TP"]
+            tp_input_step_buffer.append(
+                tp_td["TP_input"].detach().cpu().to(tp_storage_dtype).contiguous()
+            )
+            tp_groundtruth_step_buffer.append(
+                tp_td["TP_groundtruth"].detach().cpu().to(tp_storage_dtype).contiguous()
+            )
+            tp_done_step_buffer.append(
+                tp_td["TP_done"].detach().cpu().to(torch.bool).contiguous()
+            )
+            env_done_step_buffer.append(
+                done_vec.detach().cpu().to(torch.bool).contiguous()
+            )
 
         for env_idx in range(n_envs):
             if done_mask[env_idx] or not done_vec[env_idx]:
@@ -1180,7 +1629,17 @@ def run_episode_batch(
                 "goal_progress_reward": _stats_scalar(stats, "goal_progress_reward", env_idx),
                 "capture_progress_reward": _stats_scalar(stats, "capture_progress_reward", env_idx),
                 "collision": _stats_scalar(stats, "collision", env_idx),
+                "collision_drone": _stats_scalar(stats, "collision_drone", env_idx),
+                "collision_wall": _stats_scalar(stats, "collision_wall", env_idx),
+                "collision_floor": _stats_scalar(stats, "collision_floor", env_idx),
+                "pursuer_collisions_count": _stats_scalar(stats, "pursuer_collisions_count", env_idx),
                 "target_predicted_error": _stats_scalar(stats, "target_predicted_error", env_idx),
+                "expert_pred_error_pos_mean": float(
+                    (expert_pred_error_pos_sum[env_idx] / expert_pred_error_count[env_idx].clamp(min=1)).item()
+                ),
+                "expert_pred_error_next_mean": float(
+                    (expert_pred_error_next_sum[env_idx] / expert_pred_error_count[env_idx].clamp(min=1)).item()
+                ),
             }
             done_mask[env_idx] = True
 
@@ -1214,11 +1673,22 @@ def run_episode_batch(
             "capture_progress_reward": float("nan"),
             "collision": float("nan"),
             "target_predicted_error": float("nan"),
+            "expert_pred_error_pos_mean": float(
+                (expert_pred_error_pos_sum[env_idx] / expert_pred_error_count[env_idx].clamp(min=1)).item()
+            ),
+            "expert_pred_error_next_mean": float(
+                (expert_pred_error_next_sum[env_idx] / expert_pred_error_count[env_idx].clamp(min=1)).item()
+            ),
         }
 
     dataset_chunk = None
     if collect_success_dataset:
-        assert obs_step_buffer is not None and action_step_buffer is not None and aux_step_buffer is not None
+        assert (
+            obs_step_buffer is not None
+            and prev_action_step_buffer is not None
+            and action_step_buffer is not None
+            and aux_step_buffer is not None
+        )
         stacked_obs = {
             key: torch.stack([step_obs[key] for step_obs in obs_step_buffer], dim=0)
             for key in obs_step_buffer[0].keys()
@@ -1232,9 +1702,15 @@ def run_episode_batch(
             if action_step_buffer else
             torch.empty(0, n_envs, n_agents, 4, dtype=storage_dtype)
         )
+        stacked_prev_action = (
+            torch.stack(prev_action_step_buffer, dim=0)
+            if prev_action_step_buffer else
+            torch.empty(0, n_envs, n_agents, 4, dtype=storage_dtype)
+        )
 
         obs_flat = {key: [] for key in stacked_obs.keys()}
         aux_flat = {key: [] for key in stacked_aux.keys()}
+        prev_action_flat = []
         action_flat = []
         episode_lengths = []
         episode_meta = []
@@ -1251,6 +1727,7 @@ def run_episode_batch(
                 obs_flat[key].append(value[:steps, env_idx].contiguous())
             for key, value in stacked_aux.items():
                 aux_flat[key].append(value[:steps, env_idx].contiguous())
+            prev_action_flat.append(stacked_prev_action[:steps, env_idx].contiguous())
             action_flat.append(stacked_action[:steps, env_idx].contiguous())
             episode_lengths.append(steps)
             episode_meta.append({
@@ -1268,15 +1745,19 @@ def run_episode_batch(
                 for key, parts in aux_flat.items()
             }
             action_flat = torch.cat(action_flat, dim=0).contiguous()
+            prev_action_flat = torch.cat(prev_action_flat, dim=0).contiguous()
         else:
             obs_flat = {key: torch.empty(0, *value.shape[2:], dtype=value.dtype) for key, value in stacked_obs.items()}
             aux_flat = {key: torch.empty(0, *value.shape[2:], dtype=value.dtype) for key, value in stacked_aux.items()}
             action_flat = torch.empty(0, n_agents, 4, dtype=storage_dtype)
+            prev_action_flat = torch.empty(0, n_agents, 4, dtype=storage_dtype)
 
         dataset_chunk = {
             "obs": obs_flat,
             "expert_aux": aux_flat,
+            "prev_action": prev_action_flat,
             "action_raw": action_flat,
+            "action_label_type": "pidrate_normalized",
             "episode_lengths": torch.as_tensor(episode_lengths, dtype=torch.int32),
             "episode_meta": episode_meta,
             "num_success_episodes": len(episode_lengths),
@@ -1285,7 +1766,25 @@ def run_episode_batch(
             "storage_dtype": str(storage_dtype),
         }
 
-    return results, dataset_chunk
+    tp_dataset_chunk = None
+    if collect_tp_dataset:
+        assert (
+            tp_input_step_buffer is not None
+            and tp_groundtruth_step_buffer is not None
+            and tp_done_step_buffer is not None
+            and env_done_step_buffer is not None
+        )
+        tp_dataset_chunk = _build_tp_dataset_chunk(
+            tp_input_step_buffer,
+            tp_groundtruth_step_buffer,
+            tp_done_step_buffer,
+            env_done_step_buffer,
+            future_step=int(base_env.future_predcition_step),
+            window_step=int(base_env.window_step),
+            storage_dtype=tp_storage_dtype,
+        )
+
+    return results, dataset_chunk, tp_dataset_chunk
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1302,21 +1801,41 @@ def main(cfg):
     # ── unpack extra args ──────────────────────────────────────
     args        = _extra_args
     pred_mode   = args.pred_mode
+    strategy_variant = args.strategy_variant
+    forward_dir_mode = args.forward_dir_mode
+    enable_goal_mode = args.enable_goal_mode
+    enable_close_mode = args.enable_close_mode
+    enable_rush_mode = args.enable_rush_mode
+    expert2_front_layout = args.expert2_front_layout
+    expert_intercept_pred_step = int(args.expert_intercept_pred_step)
+    expert_intercept_use_direct_pred = bool(args.expert_intercept_use_direct_pred)
     tp_weight   = args.tp_weight
     n_video     = args.n_video
     n_generic   = args.n_generic
     v_prey_test = args.v_prey_test
+    v_prey_schedule = parse_float_schedule(args.v_prey_schedule, v_prey_test)
     v_drone_test = args.v_drone_test
     video_dir   = args.video_dir
     video_seed_base = args.video_seed_base
+    video_seed_list = [
+        int(x.strip()) for x in str(args.video_seed_list or "").split(",") if x.strip()
+    ]
+    if video_seed_list:
+        n_video = len(video_seed_list)
+    generic_seed_base = int(args.generic_seed_base)
     generic_batch_envs = max(1, int(args.generic_batch_envs))
     random_init = args.random_init
     episode_length = args.episode_length
     max_steps   = min(args.max_steps, episode_length)
     collect_success_dataset = bool(args.collect_success_dataset)
     dataset_dir = args.dataset_dir
+    dataset_name = str(args.dataset_name or "").strip()
     min_success_steps = max(1, int(args.min_success_steps))
     dataset_dtype = _storage_dtype(args.dataset_dtype)
+    collect_tp_dataset = bool(args.collect_tp_dataset)
+    tp_dataset_dir = args.tp_dataset_dir
+    tp_dataset_name = str(args.tp_dataset_name or "").strip()
+    tp_dataset_dtype = _storage_dtype(args.tp_dataset_dtype)
 
     # headless=True + enable_render(True) → offscreen rendering, no display needed
     # do NOT force headless=False (crashes without X server)
@@ -1357,7 +1876,7 @@ def main(cfg):
     #   → PIDRateController converts to motor RPMs
     transforms = [InitTracker()]
     controller = _PIDRateController(dt, 9.81, base_env.drone.params).to(base_env.device)
-    transforms.append(PIDRateController(controller))
+    transforms.append(PIDRateController(controller, actor_has_tanh=True))
     env = TransformedEnv(base_env, Compose(*transforms))
     env.set_seed(0)
 
@@ -1370,6 +1889,13 @@ def main(cfg):
     if pred_mode == "tp_net" and (not tp_weight or not os.path.isfile(tp_weight)):
         print(f"[Expert] tp_net weight not found: {tp_weight!r}, falling back to noise mode")
         pred_mode = "noise"
+    if pred_mode == "tp_net" and bool(getattr(cfg.algo, "use_TP_net", False)):
+        tp_state = torch.load(tp_weight, map_location=device)
+        if isinstance(tp_state, dict) and "TP" in tp_state:
+            tp_state = tp_state["TP"]
+        base_env.TP.load_state_dict(tp_state)
+        base_env.TP.eval()
+        print(f"[Expert] Env TP_net loaded for observations: {tp_weight}")
 
     hover_thrust_ratio = float(
         (base_env.drone.gravity[0, 0] / controller.max_thrusts.sum()).item()
@@ -1390,12 +1916,28 @@ def main(cfg):
     expert_cfg.max_thrust_ratio = float(controller.max_thrust_ratio)
     expert_cfg.target_clip = float(controller.target_clip)
     expert_cfg.max_body_rate_rad_s = math.radians(180.0 * expert_cfg.target_clip)
+    expert_cfg.forward_dir_mode = str(forward_dir_mode)
+    apply_shared_strategy_defaults(
+        expert_cfg,
+        strategy_variant=str(strategy_variant),
+        enable_goal_mode=enable_goal_mode,
+        enable_close_mode=enable_close_mode,
+        enable_rush_mode=enable_rush_mode,
+        expert2_front_layout=str(expert2_front_layout) if expert2_front_layout is not None else None,
+    )
+    strategy_variant = str(expert_cfg.strategy_variant)
+    enable_goal_mode = bool(expert_cfg.enable_goal_mode)
+    enable_close_mode = bool(expert_cfg.enable_close_mode)
+    enable_rush_mode = bool(expert_cfg.enable_rush_mode)
+    expert2_front_layout = str(expert_cfg.expert2_front_layout)
     if hasattr(base_env, "history_step"):
         expert_cfg.history_step = int(base_env.history_step)
     if hasattr(base_env, "future_predcition_step"):
         expert_cfg.future_predcition_step = int(base_env.future_predcition_step)
     if hasattr(base_env, "window_step"):
         expert_cfg.window_step = int(base_env.window_step)
+    expert_cfg.expert_intercept_pred_step = int(expert_intercept_pred_step)
+    expert_cfg.expert_intercept_use_direct_pred = bool(expert_intercept_use_direct_pred)
 
     def _build_expert():
         return SharedExpertPolicy(
@@ -1417,6 +1959,16 @@ def main(cfg):
     batched_expert = _build_batched_expert()
     if pred_mode == "tp_net":
         print(f"[Expert] TP_net loaded: {tp_weight}")
+    elif pred_mode.startswith("oracle_"):
+        print(f"[Expert] Oracle predictor enabled: {pred_mode}")
+    print(
+        f"[Expert] strategy_variant={strategy_variant} "
+        f"forward_dir_mode={forward_dir_mode} "
+        f"goal_mode={enable_goal_mode} close={enable_close_mode} "
+        f"rush={enable_rush_mode} front_layout={expert2_front_layout} "
+        f"intercept_pred_step={expert_intercept_pred_step} "
+        f"direct_pred={expert_intercept_use_direct_pred}"
+    )
 
     # ── rendering policy ──────────────────────────────────────
     # Generic evaluation with n_video=0 does not need the render pipeline.
@@ -1431,8 +1983,13 @@ def main(cfg):
     if collect_success_dataset:
         if not os.path.isabs(dataset_dir):
             dataset_dir = os.path.join(os.getcwd(), dataset_dir)
-        dataset_dir = os.path.join(dataset_dir, f"{cfg.task.name}_expert_{time_str}")
+        dataset_dir = os.path.join(dataset_dir, dataset_name or f"{cfg.task.name}_expert_{time_str}")
         os.makedirs(dataset_dir, exist_ok=True)
+    if collect_tp_dataset:
+        if not os.path.isabs(tp_dataset_dir):
+            tp_dataset_dir = os.path.join(os.getcwd(), tp_dataset_dir)
+        tp_dataset_dir = os.path.join(tp_dataset_dir, tp_dataset_name or f"{cfg.task.name}_tp_{time_str}")
+        os.makedirs(tp_dataset_dir, exist_ok=True)
 
     # Keep the harder target speed while using random initial positions.
     if hasattr(base_env, "_set_curriculum_stage"):
@@ -1445,11 +2002,22 @@ def main(cfg):
     base_env.target_velocity_scale = float(v_prey_test)
 
     print(f"\n[Expert eval] dt={dt:.3f}s  episode_length={episode_length}  max_steps={max_steps}")
-    print(f"             pred_mode={pred_mode}  v_drone={cfg.task.v_drone}  v_prey={v_prey_test}")
+    print(
+        f"             pred_mode={pred_mode}  strategy_variant={strategy_variant} "
+        f"forward_dir_mode={forward_dir_mode}  goal_mode={enable_goal_mode} "
+        f"close={enable_close_mode} rush={enable_rush_mode} "
+        f"front_layout={expert2_front_layout}  intercept_pred_step={expert_intercept_pred_step} "
+        f"direct_pred={expert_intercept_use_direct_pred} "
+        f"v_drone={cfg.task.v_drone}  v_prey={v_prey_test}"
+    )
+    if len(v_prey_schedule) > 1:
+        print(f"             v_prey_schedule={','.join(f'{v:.3g}' for v in v_prey_schedule)}")
     print(f"             num_envs={base_env.num_envs}  generic_batch_envs={generic_batch_envs}")
     print(f"             hover_thrust_ratio={hover_thrust_ratio:.3f}  max_body_rate={expert_cfg.max_body_rate_rad_s:.3f} rad/s")
     if collect_success_dataset:
         print(f"             dataset_dir={dataset_dir}  min_success_steps={min_success_steps}  dataset_dtype={args.dataset_dtype}")
+    if collect_tp_dataset:
+        print(f"             tp_dataset_dir={tp_dataset_dir}  tp_dataset_dtype={args.tp_dataset_dtype}")
 
     # ═══════════════════════════════════════════════════════════
     #  Part 1: Record n_video videos (random init, normal v_prey)
@@ -1457,15 +2025,18 @@ def main(cfg):
     print(f"\n{'='*60}")
     print(f"  Part 1: Recording {n_video} videos")
     print(f"  pred_mode={pred_mode}, v_prey={cfg.task.v_prey}")
+    if video_seed_list:
+        print(f"  explicit video seeds={video_seed_list}")
     print(f"{'='*60}")
 
+    video_expert = batched_expert
     video_paths = []
-    for vid_idx in range(n_video):
-        video_seed = video_seed_base + vid_idx * 100
+    seeds_to_record = video_seed_list or [video_seed_base + vid_idx * 100 for vid_idx in range(n_video)]
+    for vid_idx, video_seed in enumerate(seeds_to_record):
         env.set_seed(video_seed)
-        expert.reset()
+        video_expert.reset(1)
         frames, ep_info = run_episode(
-            env, base_env, expert,
+            env, base_env, video_expert,
             record_video=True,
             max_steps=max_steps,
         )
@@ -1507,11 +2078,18 @@ def main(cfg):
     saved_dataset_chunks = 0
     saved_dataset_episodes = 0
     saved_dataset_steps = 0
+    saved_tp_chunks = 0
+    saved_tp_samples = 0
     if int(base_env.num_envs) == 1:
         if collect_success_dataset:
             logging.warning("collect_success_dataset is intended for batched generic eval; skipping dataset save in single-env mode.")
+        if collect_tp_dataset:
+            logging.warning("collect_tp_dataset is intended for batched generic eval; skipping TP dataset save in single-env mode.")
         for ep_idx in range(n_generic):
-            env.set_seed(ep_idx * 7 + 999)
+            wave_v_prey = v_prey_schedule[ep_idx % len(v_prey_schedule)]
+            base_env.current_target_speed = float(wave_v_prey)
+            base_env.target_velocity_scale = float(wave_v_prey)
+            env.set_seed(ep_idx * 7 + generic_seed_base)
             expert.reset()
             _, ep_info = run_episode(
                 env, base_env, expert,
@@ -1533,9 +2111,12 @@ def main(cfg):
         wave = 0
         while ep_idx < n_generic:
             wave += 1
-            env.set_seed(wave * 97 + 999)
+            wave_v_prey = v_prey_schedule[(wave - 1) % len(v_prey_schedule)]
+            base_env.current_target_speed = float(wave_v_prey)
+            base_env.target_velocity_scale = float(wave_v_prey)
+            env.set_seed(wave * 97 + generic_seed_base)
             wave_start_idx = ep_idx
-            wave_results, dataset_chunk = run_episode_batch(
+            wave_results, dataset_chunk, tp_dataset_chunk = run_episode_batch(
                 env,
                 base_env,
                 batched_expert,
@@ -1543,6 +2124,8 @@ def main(cfg):
                 collect_success_dataset=collect_success_dataset,
                 storage_dtype=dataset_dtype,
                 min_success_steps=min_success_steps,
+                collect_tp_dataset=collect_tp_dataset,
+                tp_storage_dtype=tp_dataset_dtype,
             )
             if collect_success_dataset and dataset_chunk is not None and dataset_chunk["num_success_episodes"] > 0:
                 for meta in dataset_chunk["episode_meta"]:
@@ -1551,7 +2134,8 @@ def main(cfg):
                 dataset_chunk.update({
                     "wave": wave,
                     "pred_mode": pred_mode,
-                    "v_prey_test": float(v_prey_test),
+                    "v_prey_test": float(wave_v_prey),
+                    "v_prey_schedule": [float(v) for v in v_prey_schedule],
                     "v_drone_test": float(v_drone_test),
                     "episode_length": int(episode_length),
                     "batch_envs": int(base_env.num_envs),
@@ -1564,9 +2148,38 @@ def main(cfg):
                 saved_dataset_steps += int(dataset_chunk["num_success_steps"])
                 print(
                     f"  [dataset] wave={wave:03d} saved={chunk_path} "
+                    f"| v_prey={wave_v_prey:.2f} "
                     f"| success_eps={dataset_chunk['num_success_episodes']} "
                     f"| success_steps={dataset_chunk['num_success_steps']} "
                     f"| dropped_short={dataset_chunk['dropped_too_short']}"
+                )
+            if collect_tp_dataset and tp_dataset_chunk is not None and tp_dataset_chunk["num_samples"] > 0:
+                tp_dataset_chunk.update({
+                    "wave": wave,
+                    "pred_mode": pred_mode,
+                    "v_prey_test": float(wave_v_prey),
+                    "v_prey_schedule": [float(v) for v in v_prey_schedule],
+                    "v_drone_test": float(v_drone_test),
+                    "episode_length": int(episode_length),
+                    "batch_envs": int(base_env.num_envs),
+                    "dt": float(dt),
+                    "history_step": int(base_env.history_step),
+                    "future_predcition_step": int(base_env.future_predcition_step),
+                    "window_step": int(base_env.window_step),
+                    "arena_size": float(base_env.arena_size),
+                    "max_height": float(base_env.max_height),
+                    "input_dim": int(tp_dataset_chunk["TP_input"].shape[-1]),
+                    "storage_dtype": str(tp_dataset_dtype),
+                })
+                tp_chunk_path = os.path.join(tp_dataset_dir, f"tp_wave_{wave:05d}.pt")
+                torch.save(tp_dataset_chunk, tp_chunk_path)
+                saved_tp_chunks += 1
+                saved_tp_samples += int(tp_dataset_chunk["num_samples"])
+                print(
+                    f"  [tp_dataset] wave={wave:03d} saved={tp_chunk_path} "
+                    f"| v_prey={wave_v_prey:.2f} "
+                    f"| samples={tp_dataset_chunk['num_samples']} "
+                    f"| episode_steps={tp_dataset_chunk['episode_steps']}"
                 )
             for ep_info in wave_results:
                 if ep_idx >= n_generic:
@@ -1590,16 +2203,36 @@ def main(cfg):
         n_goal   = sum(1 for r in gen_results if r["goal"])
         n_landed = sum(1 for r in gen_results if r["landed"])
         n_to     = sum(1 for r in gen_results if r["timeout"])
+        n_any_collision = sum(1 for r in gen_results if r.get("collision", 0.0) > 0.0)
+        n_drone_collision = sum(1 for r in gen_results if r.get("pursuer_collisions_count", 0.0) > 0.0)
         cap_steps= [r["steps"] for r in gen_results if r["success"]]
 
+        schedule_label = (
+            f"schedule={','.join(f'{v:.3g}' for v in v_prey_schedule)}"
+            if len(v_prey_schedule) > 1
+            else f"v_prey={v_prey_test}"
+        )
         print(f"\n{'='*60}")
-        print(f"  Generalization Summary [v_prey={v_prey_test}]")
+        print(f"  Generalization Summary [{schedule_label}]")
         print(f"{'='*60}")
         print(f"  Episodes      : {n_total}")
         print(f"  ✅ Capture    : {n_cap/n_total:.0%}  ({n_cap})")
         print(f"  ❌ Goal zone  : {n_goal/n_total:.0%}  ({n_goal})")
         print(f"  ⚠️  Landed    : {n_landed/n_total:.0%}  ({n_landed})")
         print(f"  ⏱  Timeout    : {n_to/n_total:.0%}  ({n_to})")
+        print(f"  💥 Any coll   : {n_any_collision/n_total:.0%}  ({n_any_collision})")
+        print(f"  🤝 Drone coll : {n_drone_collision/n_total:.0%}  ({n_drone_collision})")
+        print(
+            f"  Expert pred   : pos_err={_mean(gen_results, 'expert_pred_error_pos_mean'):.4f}, "
+            f"next_err={_mean(gen_results, 'expert_pred_error_next_mean'):.4f}"
+        )
+        print(
+            f"  Collision avg : any={_mean(gen_results, 'collision'):.3f}, "
+            f"drone={_mean(gen_results, 'collision_drone'):.3f}, "
+            f"wall={_mean(gen_results, 'collision_wall'):.3f}, "
+            f"floor={_mean(gen_results, 'collision_floor'):.3f}, "
+            f"pairs={_mean(gen_results, 'pursuer_collisions_count'):.3f}"
+        )
         if cap_steps:
             print(f"  Capture steps : mean={np.mean(cap_steps):.1f}, "
                   f"std={np.std(cap_steps):.1f}, "
@@ -1613,7 +2246,9 @@ def main(cfg):
                 f"ahead={_mean(timeout_eps, 'n_agents_ahead_mean'):.2f}, "
                 f"team={_mean(timeout_eps, 'phi_team'):.3f}, "
                 f"spread={_mean(timeout_eps, 'phi_spread'):.3f}, "
-                f"cap_prog={_mean(timeout_eps, 'capture_progress_reward'):.4f}"
+                f"cap_prog={_mean(timeout_eps, 'capture_progress_reward'):.4f}, "
+                f"pred_pos={_mean(timeout_eps, 'expert_pred_error_pos_mean'):.4f}, "
+                f"pred_next={_mean(timeout_eps, 'expert_pred_error_next_mean'):.4f}"
             )
         if capture_eps:
             print(
@@ -1622,7 +2257,9 @@ def main(cfg):
                 f"ahead={_mean(capture_eps, 'n_agents_ahead_mean'):.2f}, "
                 f"team={_mean(capture_eps, 'phi_team'):.3f}, "
                 f"spread={_mean(capture_eps, 'phi_spread'):.3f}, "
-                f"cap_prog={_mean(capture_eps, 'capture_progress_reward'):.4f}"
+                f"cap_prog={_mean(capture_eps, 'capture_progress_reward'):.4f}, "
+                f"pred_pos={_mean(capture_eps, 'expert_pred_error_pos_mean'):.4f}, "
+                f"pred_next={_mean(capture_eps, 'expert_pred_error_next_mean'):.4f}"
             )
         print(f"{'='*60}")
         if collect_success_dataset:
@@ -1631,6 +2268,12 @@ def main(cfg):
                 f"| success_episodes={saved_dataset_episodes} "
                 f"| success_steps={saved_dataset_steps} "
                 f"| dir={dataset_dir}"
+            )
+        if collect_tp_dataset:
+            print(
+                f"  TP dataset    : chunks={saved_tp_chunks} "
+                f"| samples={saved_tp_samples} "
+                f"| dir={tp_dataset_dir}"
             )
     print(f"\n  Videos saved:")
     for p in video_paths:

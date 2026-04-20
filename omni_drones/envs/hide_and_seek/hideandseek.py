@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import wandb
 import time
 from functorch import vmap
-from omni_drones.utils.torch import cpos, off_diag, quat_axis, others
+from omni_drones.utils.torch import cpos, off_diag, quat_axis, quat_rotate_inverse, others
 import torch.distributions as D
 from torch.masked import masked_tensor, as_masked_tensor
 
@@ -22,6 +22,7 @@ from omni_drones.views import RigidPrimView
 from omni_drones.envs.isaac_env import IsaacEnv, AgentSpec
 from omni_drones.robots.config import RobotCfg
 from omni_drones.robots.drone import MultirotorBase
+from omni_drones.controllers import PIDRateController as LowLevelPIDRateController
 import omni_drones.utils.kit as kit_utils
 # import omni_drones.utils.restart_sampling as rsp
 from pxr import UsdGeom, Usd, UsdPhysics
@@ -38,9 +39,10 @@ import os
 from .draw import draw_traj, draw_detection, draw_catch, draw_court
 from .draw_circle import Float3, _COLOR_ACCENT, _carb_float3_add, draw_court_circle
 import time
-import collections
+import itertools
 from omni_drones.learning import TP_net
 import math
+from typing import Optional, Tuple
 
 
 def polygon_area_xy(points_xy: torch.Tensor) -> torch.Tensor:
@@ -85,6 +87,10 @@ def clip_vector_norm(v: torch.Tensor, max_norm: float) -> torch.Tensor:
 
 def safe_normalize(v: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return v / (torch.norm(v, dim=-1, keepdim=True) + eps)
+
+
+def project_to_plane(v: torch.Tensor, normal: torch.Tensor) -> torch.Tensor:
+    return v - (v * normal).sum(dim=-1, keepdim=True) * normal
 
 
 def compute_phi_team(
@@ -175,7 +181,7 @@ class HideAndSeek(IsaacEnv):
         _compute_state_and_obs(self):
             Obtain the observations and states tensor from drone state data
             Observations are organized into:
-                state_self: target relative state, target prediction, self state, one-dimensional time encoding
+                state_self: target relative state, target prediction, self state, role encoding, time encoding
                 state_others: teammate relative state plus defense-geometry features
                 cooperation: shared goal-defense coordination features
             States contain centralized drone features for the critic
@@ -191,16 +197,40 @@ class HideAndSeek(IsaacEnv):
     """
     def __init__(self, cfg, headless):
         self.max_agents = int(cfg.task.max_agents)
-        self.cooperation_dim = 10
-        self.state_others_dim = 8
+        self.use_role_encoding = bool(getattr(cfg.task, "use_role_encoding", True))
+        self.role_encoding_dim = 3 if self.use_role_encoding else 0
+        self.future_prediction_obs_steps = int(getattr(cfg.task, "future_predcition_step", 5))
+        self.cooperation_dim = 9 + 3 * self.future_prediction_obs_steps
+        self.state_others_dim = 6 + self.role_encoding_dim
+        self.target_dynamics_mode = str(
+            getattr(cfg.task, "target_dynamics_mode", "point_mass")
+        ).lower()
         super().__init__(cfg, headless)
         self.drone.initialize()
-        self.target = RigidPrimView(
-            "/World/envs/env_*/target",
-            reset_xform_properties=False,
-            shape=[self.num_envs, -1],
-        )
-        self.target.initialize()
+        self.target_controller = None
+        if self.target_dynamics_mode == "uav":
+            self.target.initialize()
+            self.target_controller = LowLevelPIDRateController(
+                self.dt, 9.81, self.target.params
+            ).to(self.device)
+            self.target_hover_thrust_ratio = float(
+                (self.target.gravity[0, 0] / self.target_controller.max_thrusts.sum()).item()
+            )
+            self.target_max_body_rate_rad_s = math.radians(
+                180.0 * float(self.target_controller.target_clip)
+            )
+        elif self.target_dynamics_mode == "point_mass":
+            self.target = RigidPrimView(
+                "/World/envs/env_*/target",
+                reset_xform_properties=False,
+                shape=[self.num_envs, -1],
+            )
+            self.target.initialize()
+        else:
+            raise ValueError(
+                "task.target_dynamics_mode must be either 'point_mass' or 'uav', "
+                f"got {self.target_dynamics_mode!r}."
+            )
         
         self.time_encoding = self.cfg.task.time_encoding
 
@@ -211,11 +241,15 @@ class HideAndSeek(IsaacEnv):
         self.collision_radius = self.cfg.task.collision_radius
         self.init_poses = self.drone.get_world_poses(clone=True)
         self.v_prey = self.cfg.task.v_drone * self.cfg.task.v_prey
+        self.base_pursuer_speed = float(self.cfg.task.v_drone)
         self.base_target_speed = float(self.v_prey)
+        self.current_pursuer_speed = float(self.base_pursuer_speed)
         self.current_target_speed = float(self.base_target_speed)
         self.catch_reward_coef = self.cfg.task.catch_reward_coef
         self.timeout_penalty_coef = float(getattr(self.cfg.task, "timeout_penalty_coef", 2.0))
         self.collision_coef = float(self.cfg.task.collision_coef)
+        self.reward_profile = str(getattr(self.cfg.task, "reward_profile", "default"))
+        self.spread_reward_coef = float(getattr(self.cfg.task, "spread_reward_coef", 0.0))
         self.speed_coef = self.cfg.task.speed_coef
         self.capture_progress_coef = float(getattr(self.cfg.task, "capture_progress_coef", 0.2))
         self.coop_phi_coef = float(getattr(self.cfg.task, "coop_phi_coef", 0.15))
@@ -225,6 +259,45 @@ class HideAndSeek(IsaacEnv):
         self.coop_anneal_portion = float(getattr(self.cfg.task, "coop_anneal_portion", 0.50))
         self.goal_progress_scale = float(getattr(self.cfg.task, "goal_progress_scale", 0.05))
         self.capture_progress_scale = float(getattr(self.cfg.task, "capture_progress_scale", 0.05))
+        self.expert2_role_reward_coef = float(getattr(self.cfg.task, "expert2_role_reward_coef", 0.30))
+        self.expert2_role_reward_scale = float(getattr(self.cfg.task, "expert2_role_reward_scale", 0.05))
+        self.expert2_role_front_side = float(getattr(self.cfg.task, "expert2_role_front_side", 0.40))
+        self.expert2_role_rear_back = float(getattr(self.cfg.task, "expert2_role_rear_back", 0.10))
+        self.expert2_role_close_enabled = bool(getattr(self.cfg.task, "expert2_role_close_enabled", True))
+        self.expert2_role_goal_dist_switch = float(getattr(self.cfg.task, "expert2_role_goal_dist_switch", 1.40))
+        self.expert2_role_far_lookahead = float(getattr(self.cfg.task, "expert2_role_far_lookahead", 0.18))
+        self.expert2_role_near_lookahead = float(getattr(self.cfg.task, "expert2_role_near_lookahead", 0.10))
+        self.expert2_intercept_pred_step = int(
+            getattr(
+                self.cfg.task,
+                "expert_intercept_pred_step",
+                getattr(self.cfg.task, "expert2_intercept_pred_step", 5),
+            )
+        )
+        self.expert2_intercept_use_direct_pred = bool(
+            getattr(
+                self.cfg.task,
+                "expert_intercept_use_direct_pred",
+                getattr(self.cfg.task, "expert2_intercept_use_direct_pred", False),
+            )
+        )
+        self.expert2_role_close_wp_threshold = float(getattr(self.cfg.task, "expert2_role_close_wp_threshold", 0.45))
+        self.expert2_role_chaser_close_target_threshold = float(getattr(self.cfg.task, "expert2_role_chaser_close_target_threshold", 0.95))
+        self.expert2_role_front_close_target_threshold = float(getattr(self.cfg.task, "expert2_role_front_close_target_threshold", 0.75))
+        self.expert2_role_close_chaser_back = float(getattr(self.cfg.task, "expert2_role_close_chaser_back", 0.10))
+        self.expert2_role_close_front_forward = float(getattr(self.cfg.task, "expert2_role_close_front_forward", 0.03))
+        self.expert2_role_close_front_side = float(getattr(self.cfg.task, "expert2_role_close_front_side", 0.24))
+        self.expert2_close_reward_coef = float(
+            getattr(self.cfg.task, "expert2_close_reward_coef", self.expert2_role_reward_coef)
+        )
+        self.expert2_close_reward_scale = float(
+            getattr(self.cfg.task, "expert2_close_reward_scale", self.expert2_role_reward_scale)
+        )
+        self.soft_separation_start = float(getattr(self.cfg.task, "soft_separation_start", 0.40))
+        self.soft_separation_end = float(getattr(self.cfg.task, "soft_separation_end", 0.20))
+        self.soft_separation_penalty_coef = float(
+            getattr(self.cfg.task, "soft_separation_penalty_coef", 2.0)
+        )
         self.di_scale = float(getattr(self.cfg.task, "di_scale", 0.15))
         self.urgent_goal_dist = float(getattr(self.cfg.task, "urgent_goal_dist", 0.8))
         self.urgent_goal_tau = float(getattr(self.cfg.task, "urgent_goal_tau", 0.15))
@@ -242,9 +315,15 @@ class HideAndSeek(IsaacEnv):
         self.goal_progress_coef = float(getattr(self.cfg.task, "goal_progress_coef", 1.0))
         self.goal_penalty_coef = float(getattr(self.cfg.task, "goal_penalty_coef", 200.0))
         self.target_goal_attraction_coef = float(getattr(self.cfg.task, "target_goal_attraction_coef", 1.0))
+        self.target_repulsion_coef = float(getattr(self.cfg.task, "target_repulsion_coef", 1.0))
         self.target_accel_limit = float(getattr(self.cfg.task, "target_accel_limit", 2.0))
         self.target_velocity_damping = float(getattr(self.cfg.task, "target_velocity_damping", 0.25))
         self.target_command_tau = float(getattr(self.cfg.task, "target_command_tau", 0.15))
+        self.target_uav_velocity_gain = float(getattr(self.cfg.task, "target_uav_velocity_gain", 3.2))
+        self.target_uav_max_tilt_deg = float(getattr(self.cfg.task, "target_uav_max_tilt_deg", 25.0))
+        self.target_uav_rate_fraction = float(getattr(self.cfg.task, "target_uav_rate_fraction", 0.65))
+        self.target_uav_acc_feedforward_scale = float(getattr(self.cfg.task, "target_uav_acc_feedforward_scale", 0.50))
+        self.target_min_z = float(getattr(self.cfg.task, "target_min_z", 0.2))
         self.use_eval = self.cfg.task.use_eval
         self.use_partial_obs = self.cfg.task.use_partial_obs
         self.goal_region_radius = float(getattr(self.cfg.task, "goal_region_radius", 0.5))
@@ -271,20 +350,34 @@ class HideAndSeek(IsaacEnv):
             dtype=torch.float32,
         )
         self.goal_distance_norm = max(self.arena_size, 1e-6)
-        self.velocity_scale = max(float(self.cfg.task.v_drone), 1e-6)
+        self.velocity_scale = max(float(self.current_pursuer_speed), 1e-6)
         self.target_velocity_scale = max(float(self.current_target_speed), 1e-6)
         curr_cfg = getattr(self.cfg.task, "curriculum", None)
         default_curriculum_stages = [
-            {"distance_range": (0.3, 0.8), "target_speed": 0.5, "promote_success": 0.60, "promote_capture_step": 400.0},
-            {"distance_range": (0.5, 1.5), "target_speed": 0.8, "promote_success": 0.50},
-            {"distance_range": (1.0, 2.5), "target_speed": self.base_target_speed},
+            {"distance_range": (0.3, 0.8), "pursuer_speed": 0.8, "target_speed": 0.5},
+            {"distance_range": (0.5, 1.5), "pursuer_speed": 1.0, "target_speed": 1.0},
+            {"distance_range": (1.0, 2.5), "pursuer_speed": 1.5, "target_speed": 1.5},
+            {"distance_range": (2.0, 3.5), "pursuer_speed": 1.5, "target_speed": 1.7},
         ]
         self.curriculum_enabled = bool(getattr(curr_cfg, "enabled", False)) and self.scenario_flag == "goal_defense"
         self.curriculum_eval_uses_fixed_layout = bool(getattr(curr_cfg, "eval_uses_fixed_layout", True))
+        eval_promote_cfg = getattr(curr_cfg, "eval_promote", None) if curr_cfg is not None else None
+        self.curriculum_eval_promote_enabled = bool(getattr(eval_promote_cfg, "enabled", False))
+        self.curriculum_start_stage = int(getattr(curr_cfg, "start_stage", 1)) - 1
         self.curriculum_ema_alpha = float(getattr(curr_cfg, "ema_alpha", 0.10))
         self.curriculum_min_stage_episodes = int(getattr(curr_cfg, "min_stage_episodes", max(self.num_envs, 100)))
+        self.curriculum_pursuer_spawn_mode = str(getattr(curr_cfg, "pursuer_spawn_mode", "uniform"))
+        self.curriculum_goal_side_angle = math.radians(float(getattr(curr_cfg, "goal_side_angle_deg", 65.0)))
+        self.curriculum_goal_side_angle_jitter = math.radians(
+            float(getattr(curr_cfg, "goal_side_angle_jitter_deg", 10.0))
+        )
         self.curriculum_target_spawn_x = tuple(getattr(curr_cfg, "target_spawn_x", (-0.9, -0.2)))
         self.curriculum_target_spawn_y = tuple(getattr(curr_cfg, "target_spawn_y", (-1.0, 1.0)))
+        self.curriculum_front_box_target_x = tuple(getattr(curr_cfg, "front_box_target_x", (-3.0, -2.5)))
+        self.curriculum_front_box_target_y = tuple(getattr(curr_cfg, "front_box_target_y", (-1.0, 1.0)))
+        self.curriculum_front_box_drone_x = tuple(getattr(curr_cfg, "front_box_drone_x", (1.0, 2.0)))
+        self.curriculum_front_box_drone_y = tuple(getattr(curr_cfg, "front_box_drone_y", (-1.0, 1.0)))
+        self.curriculum_front_box_max_z_diff = float(getattr(curr_cfg, "front_box_max_z_diff", 1.0))
         self.curriculum_target_z_jitter = float(getattr(curr_cfg, "target_z_jitter", 0.15))
         self.curriculum_drone_z_jitter = float(getattr(curr_cfg, "drone_z_jitter", 0.15))
         self.curriculum_drone_min_separation = float(
@@ -297,6 +390,7 @@ class HideAndSeek(IsaacEnv):
                 dist_range = tuple(float(v) for v in stage_cfg.pursuer_target_dist)
                 parsed_stage = {
                     "distance_range": dist_range,
+                    "pursuer_speed": float(getattr(stage_cfg, "pursuer_speed", self.base_pursuer_speed)),
                     "target_speed": float(getattr(stage_cfg, "target_speed", self.base_target_speed)),
                 }
                 if hasattr(stage_cfg, "promote_success"):
@@ -311,17 +405,37 @@ class HideAndSeek(IsaacEnv):
         self.curriculum_success_ema = 0.0
         self.curriculum_capture_step_ema = float(self.max_episode_length)
         self.curriculum_capture_ema_initialized = False
-        self._set_curriculum_stage(
-            0 if self.curriculum_enabled else len(self.curriculum_stages) - 1,
-            reset_metrics=True,
-            announce=False,
-        )
+        initial_stage = self.curriculum_start_stage if self.curriculum_enabled else len(self.curriculum_stages) - 1
+        self._set_curriculum_stage(initial_stage, reset_metrics=True, announce=False)
         self.capture = torch.zeros(self.num_envs, self.num_agents, device=self.device)
         self.min_dist = torch.ones(self.num_envs, 1, device=self.device) * float(torch.inf) # for teacher evaluation
         # prev_target_dist for distance progress reward: [num_envs, num_agents]
         self.prev_target_dist = torch.zeros(self.num_envs, self.num_agents, device=self.device)
         self.prev_goal_dist = torch.zeros(self.num_envs, 1, device=self.device)
+        self.prev_expert2_role_dist = torch.zeros(self.num_envs, self.num_agents, device=self.device)
+        self.prev_expert2_role_dist_ready = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+        self.prev_expert2_close_triggered = torch.zeros(
+            self.num_envs, self.num_agents, dtype=torch.bool, device=self.device
+        )
+        self.expert2_role_permutations = torch.tensor(
+            list(itertools.permutations(range(self.num_agents))),
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.expert2_prev_assignment = torch.full(
+            (self.num_envs, self.num_agents),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.expert2_assignment_ready = torch.zeros(
+            self.num_envs, 1, dtype=torch.bool, device=self.device
+        )
+        self._expert2_cached_active_waypoint = None
+        self._expert2_cached_close_triggered = None
         self.target_acc_cmd = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.target_vel_cmd = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.target_pid_reset = torch.ones(self.num_envs, 1, dtype=torch.bool, device=self.device)
         
         self.central_env_pos = Float3(
             *self.envs_positions[self.central_env_idx].tolist()
@@ -370,8 +484,23 @@ class HideAndSeek(IsaacEnv):
             future_predcition_step=self.future_predcition_step,
             window_step=self.window_step,
         ).to(self.device)
-        self.history_step = self.cfg.task.history_step
-        self.history_data = collections.deque(maxlen=self.history_step)
+        self.history_step = int(self.cfg.task.history_step)
+        self.tp_frame_dim = 1 + 3 + 3 + 3 * self.max_agents
+        # Keep per-env TP history so partial resets do not leak stale traces
+        # from finished environments into freshly reset ones.
+        self.tp_history_buffer = torch.zeros(
+            self.num_envs,
+            self.history_step,
+            self.tp_frame_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.tp_history_initialized = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.target_pos_predicted = None
         # self.debug_list = []
 
         # for deployment
@@ -385,11 +514,14 @@ class HideAndSeek(IsaacEnv):
         self.curriculum_stage = stage
         stage_cfg = self.curriculum_stages[stage]
         if self.curriculum_enabled:
+            self.current_pursuer_speed = float(stage_cfg.get("pursuer_speed", self.base_pursuer_speed))
             self.current_target_speed = float(stage_cfg["target_speed"])
         else:
             # When curriculum is disabled, respect the caller-provided base target speed
             # instead of silently snapping to the YAML stage preset.
+            self.current_pursuer_speed = float(self.base_pursuer_speed)
             self.current_target_speed = float(self.base_target_speed)
+        self.velocity_scale = max(self.current_pursuer_speed, 1e-6)
         self.target_velocity_scale = max(self.current_target_speed, 1e-6)
         if reset_metrics:
             self.curriculum_stage_episodes = 0
@@ -398,15 +530,18 @@ class HideAndSeek(IsaacEnv):
             self.curriculum_capture_ema_initialized = False
         if announce and self.curriculum_enabled:
             logging.info(
-                "[Curriculum] switched to stage %d | pursuer-target dist=(%.2f, %.2f) | target_speed=%.2f",
+                "[Curriculum] switched to stage %d | pursuer-target dist=(%.2f, %.2f) | pursuer_speed=%.2f | target_speed=%.2f",
                 stage + 1,
                 stage_cfg["distance_range"][0],
                 stage_cfg["distance_range"][1],
+                self.current_pursuer_speed,
                 self.current_target_speed,
             )
 
     def _maybe_advance_curriculum(self):
         if not self.curriculum_enabled:
+            return
+        if self.curriculum_eval_promote_enabled:
             return
         if self.curriculum_stage >= len(self.curriculum_stages) - 1:
             return
@@ -463,11 +598,53 @@ class HideAndSeek(IsaacEnv):
         target_pos[..., 0].uniform_(min(target_x_min, target_x_max), max(target_x_min, target_x_max))
         target_pos[..., 1].uniform_(min(target_y_min, target_y_max), max(target_y_min, target_y_max))
         target_pos[..., 2].uniform_(goal_z - self.curriculum_target_z_jitter, goal_z + self.curriculum_target_z_jitter)
-        target_pos[..., 2].clamp_(0.3, self.max_height - 0.1)
+        target_pos[..., 2].clamp_(self.target_min_z, self.max_height - 0.1)
 
         drone_pos = torch.zeros(num_envs, self.num_agents, 3, device=self.device)
+        if self.curriculum_pursuer_spawn_mode == "front_box":
+            tx_min, tx_max = self.curriculum_front_box_target_x
+            ty_min, ty_max = self.curriculum_front_box_target_y
+            dx_min, dx_max = self.curriculum_front_box_drone_x
+            dy_min, dy_max = self.curriculum_front_box_drone_y
+            target_pos[..., 0].uniform_(min(tx_min, tx_max), max(tx_min, tx_max))
+            target_pos[..., 1].uniform_(min(ty_min, ty_max), max(ty_min, ty_max))
+            for env_idx in range(num_envs):
+                target_z = target_pos[env_idx, 0, 2]
+                placed = False
+                for _ in range(self.curriculum_max_sample_attempts):
+                    candidate = torch.zeros(self.num_agents, 3, device=self.device)
+                    candidate[:, 0].uniform_(min(dx_min, dx_max), max(dx_min, dx_max))
+                    candidate[:, 1].uniform_(min(dy_min, dy_max), max(dy_min, dy_max))
+                    candidate[:, 2].uniform_(
+                        target_z - self.curriculum_front_box_max_z_diff,
+                        target_z + self.curriculum_front_box_max_z_diff,
+                    )
+                    candidate[:, 2].clamp_(0.3, self.max_height - 0.1)
+                    if self.num_agents > 1:
+                        pairwise = torch.cdist(candidate[:, :2], candidate[:, :2])
+                        pairwise.fill_diagonal_(float("inf"))
+                        separated = bool((pairwise >= self.curriculum_drone_min_separation).all())
+                    else:
+                        separated = True
+                    if separated:
+                        drone_pos[env_idx] = candidate
+                        placed = True
+                        break
+                if not placed:
+                    candidate = torch.zeros(self.num_agents, 3, device=self.device)
+                    candidate[:, 0] = torch.linspace(min(dx_min, dx_max), max(dx_min, dx_max), self.num_agents, device=self.device)
+                    candidate[:, 1] = torch.linspace(min(dy_min, dy_max), max(dy_min, dy_max), self.num_agents, device=self.device)
+                    candidate[:, 2] = target_z
+                    drone_pos[env_idx] = candidate
+            return drone_pos, target_pos
+
+        fallback_angle = (
+            self.curriculum_goal_side_angle
+            if self.curriculum_pursuer_spawn_mode == "goal_side_arc"
+            else 0.5 * math.pi
+        )
         fallback_offsets = torch.linspace(
-            -0.5 * math.pi, 0.5 * math.pi, self.num_agents, device=self.device
+            -fallback_angle, fallback_angle, self.num_agents, device=self.device
         ) if self.num_agents > 1 else torch.zeros(1, device=self.device)
 
         for env_idx in range(num_envs):
@@ -476,7 +653,24 @@ class HideAndSeek(IsaacEnv):
             placed = False
             for _ in range(self.curriculum_max_sample_attempts):
                 radii = torch.empty(self.num_agents, device=self.device).uniform_(dist_min, dist_max)
-                angles = torch.empty(self.num_agents, device=self.device).uniform_(0.0, 2.0 * math.pi)
+                if self.curriculum_pursuer_spawn_mode == "goal_side_arc":
+                    goal_dir = safe_normalize(
+                        (self.goal_region_center[:2] - target_xy).unsqueeze(0)
+                    ).squeeze(0)
+                    base_angle = torch.atan2(goal_dir[1], goal_dir[0])
+                    angle_offsets = torch.linspace(
+                        -self.curriculum_goal_side_angle,
+                        self.curriculum_goal_side_angle,
+                        self.num_agents,
+                        device=self.device,
+                    ) if self.num_agents > 1 else torch.zeros(1, device=self.device)
+                    angle_jitter = torch.empty(self.num_agents, device=self.device).uniform_(
+                        -self.curriculum_goal_side_angle_jitter,
+                        self.curriculum_goal_side_angle_jitter,
+                    )
+                    angles = base_angle + angle_offsets + angle_jitter
+                else:
+                    angles = torch.empty(self.num_agents, device=self.device).uniform_(0.0, 2.0 * math.pi)
                 z_offsets = torch.empty(self.num_agents, device=self.device).uniform_(
                     -self.curriculum_drone_z_jitter, self.curriculum_drone_z_jitter
                 )
@@ -526,25 +720,16 @@ class HideAndSeek(IsaacEnv):
         self.future_predcition_step = self.cfg.task.future_predcition_step
         self.history_step = self.cfg.task.history_step
         self.window_step = self.cfg.task.window_step
-
-        if self.use_TP_net:
-            observation_spec = CompositeSpec({
-                "state_self": UnboundedContinuousTensorSpec((1, 3 + 3 * self.future_predcition_step + self.time_encoding_dim + 13)),
-                "state_others": UnboundedContinuousTensorSpec((self.drone.n-1, self.state_others_dim)),
-                "cooperation": UnboundedContinuousTensorSpec((1, self.cooperation_dim)),
-            }).to(self.device)
-            state_spec = CompositeSpec({
-                "state_drones": UnboundedContinuousTensorSpec((self.drone.n, 3 + 3 * self.future_predcition_step + self.time_encoding_dim + 13 + self.cooperation_dim)),
-            }).to(self.device)
-        else:
-            observation_spec = CompositeSpec({
-                "state_self": UnboundedContinuousTensorSpec((1, 3 + self.time_encoding_dim + 13)),
-                "state_others": UnboundedContinuousTensorSpec((self.drone.n-1, self.state_others_dim)),
-                "cooperation": UnboundedContinuousTensorSpec((1, self.cooperation_dim)),
-            }).to(self.device)
-            state_spec = CompositeSpec({
-                "state_drones": UnboundedContinuousTensorSpec((self.drone.n, 3 + self.time_encoding_dim + 13 + self.cooperation_dim)),
-            }).to(self.device)
+        role_dim = self.role_encoding_dim
+        state_self_dim = 20 + role_dim
+        observation_spec = CompositeSpec({
+            "state_self": UnboundedContinuousTensorSpec((1, state_self_dim)),
+            "state_others": UnboundedContinuousTensorSpec((self.drone.n-1, self.state_others_dim)),
+            "cooperation": UnboundedContinuousTensorSpec((1, self.cooperation_dim)),
+        }).to(self.device)
+        state_spec = CompositeSpec({
+            "state_drones": UnboundedContinuousTensorSpec((self.drone.n, state_self_dim + self.cooperation_dim)),
+        }).to(self.device)
         
         TP_spec = CompositeSpec({
             "TP_input": UnboundedContinuousTensorSpec((self.history_step, 1 + 3 + 3 + self.max_agents * 3)),
@@ -590,6 +775,9 @@ class HideAndSeek(IsaacEnv):
             "speed_reward": UnboundedContinuousTensorSpec(1),
             "time_penalty": UnboundedContinuousTensorSpec(1),
             "coop_reward": UnboundedContinuousTensorSpec(1),
+            "spread_reward": UnboundedContinuousTensorSpec(1),
+            "close_reward": UnboundedContinuousTensorSpec(1),
+            "role_reward": UnboundedContinuousTensorSpec(1),
             "phi_team": UnboundedContinuousTensorSpec(1),
             "phi_block": UnboundedContinuousTensorSpec(1),
             "phi_pressure": UnboundedContinuousTensorSpec(1),
@@ -599,6 +787,7 @@ class HideAndSeek(IsaacEnv):
             "urgent_block_rate": UnboundedContinuousTensorSpec(1),
             "n_agents_ahead_mean": UnboundedContinuousTensorSpec(1),
             "collision_penalty": UnboundedContinuousTensorSpec(1),
+            "separation_penalty": UnboundedContinuousTensorSpec(1),
             "collision_wall": UnboundedContinuousTensorSpec(1),
             "collision_floor": UnboundedContinuousTensorSpec(1),
             "collision_drone": UnboundedContinuousTensorSpec(1),
@@ -611,6 +800,7 @@ class HideAndSeek(IsaacEnv):
             "curriculum_stage": UnboundedContinuousTensorSpec(1),
             "curriculum_success_ema": UnboundedContinuousTensorSpec(1),
             "curriculum_capture_step_ema": UnboundedContinuousTensorSpec(1),
+            "curriculum_pursuer_speed": UnboundedContinuousTensorSpec(1),
             "curriculum_target_speed": UnboundedContinuousTensorSpec(1),
             "sum_detect_step": UnboundedContinuousTensorSpec(1),
             "return": UnboundedContinuousTensorSpec(1),
@@ -624,6 +814,7 @@ class HideAndSeek(IsaacEnv):
         }).expand(self.num_envs).to(self.device)
         info_spec = CompositeSpec({
             "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
+            "target_state": UnboundedContinuousTensorSpec((1, 6), device=self.device),
             "prev_action": torch.stack([self.drone.action_spec] * self.drone.n, 0).to(self.device),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
@@ -665,15 +856,6 @@ class HideAndSeek(IsaacEnv):
         self.drone: MultirotorBase = drone_model(cfg=cfg)
         self.drone.spawn(drone_pos)
 
-        # init prey as a bounded double-integrator point mass.
-        objects.DynamicSphere(
-            prim_path="/World/envs/env_0/target",
-            name="target",
-            translation=target_pos,
-            radius=0.05,
-            color=torch.tensor([1.0, 0.0, 0.0]),
-            mass=1.0,
-        )
         target_physics_max_velocity = float(
             getattr(
                 self.cfg.task,
@@ -681,13 +863,33 @@ class HideAndSeek(IsaacEnv):
                 max(5.0, self.cfg.task.v_drone * self.cfg.task.v_prey * 3.0),
             )
         )
-        kit_utils.set_rigid_body_properties(
-            prim_path="/World/envs/env_0/target",
-            disable_gravity=True,
-            linear_damping=0.0,
-            angular_damping=0.0,
-            max_linear_velocity=target_physics_max_velocity,
-        )
+        if self.target_dynamics_mode == "uav":
+            target_model_name = str(getattr(self.cfg.task, "target_drone_model", self.cfg.task.drone_model))
+            target_model = MultirotorBase.REGISTRY[target_model_name]
+            target_cfg = target_model.cfg_cls(force_sensor=False)
+            target_cfg.rigid_props.max_linear_velocity = target_physics_max_velocity
+            self.target: MultirotorBase = target_model(name="target_drone", cfg=target_cfg)
+            self.target.spawn(
+                target_pos,
+                prim_paths=["/World/envs/env_0/target_drone_0"],
+            )
+        else:
+            # init prey as a bounded double-integrator point mass.
+            objects.DynamicSphere(
+                prim_path="/World/envs/env_0/target",
+                name="target",
+                translation=target_pos,
+                radius=0.05,
+                color=torch.tensor([1.0, 0.0, 0.0]),
+                mass=1.0,
+            )
+            kit_utils.set_rigid_body_properties(
+                prim_path="/World/envs/env_0/target",
+                disable_gravity=True,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=target_physics_max_velocity,
+            )
     
         # kit_utils.create_ground_plane(
         #     "/World/defaultGroundPlane",
@@ -719,15 +921,23 @@ class HideAndSeek(IsaacEnv):
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids)
+        if self.target_dynamics_mode == "uav":
+            self.target._reset_idx(env_ids)
 
         use_goal_defense_curriculum = (
             self.curriculum_enabled
             and self.scenario_flag == "goal_defense"
             and (self.training or not self.curriculum_eval_uses_fixed_layout)
         )
+        use_goal_defense_random_profile = (
+            (not self.curriculum_enabled)
+            and self.scenario_flag == "goal_defense"
+            and self.curriculum_pursuer_spawn_mode == "front_box"
+        )
+        use_goal_defense_random_reset = use_goal_defense_curriculum or use_goal_defense_random_profile
 
         # init, fixed xy and randomize z
-        if use_goal_defense_curriculum:
+        if use_goal_defense_random_reset:
             drone_pos, target_pos = self._sample_goal_defense_curriculum_positions(env_ids)
         elif not self.use_eval:
             # random pos
@@ -754,7 +964,7 @@ class HideAndSeek(IsaacEnv):
             )
 
         # Add position noise to fixed initial positions for exploration diversity
-        if self.use_eval and not use_goal_defense_curriculum:
+        if self.use_eval and not use_goal_defense_random_reset:
             pos_noise_xy = 0.15  # ±0.15m noise on x,y
             pos_noise_z = 0.1   # ±0.10m noise on z
             drone_noise = torch.zeros(len(env_ids), self.num_agents, 3, device=self.device)
@@ -770,7 +980,7 @@ class HideAndSeek(IsaacEnv):
             target_noise[..., 2].uniform_(-pos_noise_z, pos_noise_z)
             target_pos = target_pos.unsqueeze(0).expand(len(env_ids), -1, -1) + target_noise
             target_pos[..., :2].clamp_(-self.arena_size + 0.05, self.arena_size - 0.05)
-            target_pos[..., 2].clamp_(0.2, self.max_height - 0.1)
+            target_pos[..., 2].clamp_(self.target_min_z, self.max_height - 0.1)
 
         # drone_pos = self.init_drone_pos_dist.sample((*env_ids.shape, self.num_agents))
         rpy = self.init_rpy_dist.sample((*env_ids.shape, self.num_agents))
@@ -793,6 +1003,8 @@ class HideAndSeek(IsaacEnv):
         target_init_velocities = torch.zeros(len(env_ids), 6, device=self.device)
         self.target.set_velocities(target_init_velocities, env_ids)
         self.target_acc_cmd[env_ids] = 0.0
+        self.target_vel_cmd[env_ids] = 0.0
+        self.target_pid_reset[env_ids] = True
 
         # reset stats
         self.stats[env_ids] = 0.
@@ -800,6 +1012,7 @@ class HideAndSeek(IsaacEnv):
         self.stats["curriculum_stage"][env_ids] = float(self.curriculum_stage + 1)
         self.stats["curriculum_success_ema"][env_ids] = float(self.curriculum_success_ema)
         self.stats["curriculum_capture_step_ema"][env_ids] = float(self.curriculum_capture_step_ema)
+        self.stats["curriculum_pursuer_speed"][env_ids] = float(self.current_pursuer_speed)
         self.stats["curriculum_target_speed"][env_ids] = float(self.current_target_speed)
 
         # init prev_actions: hover
@@ -810,6 +1023,15 @@ class HideAndSeek(IsaacEnv):
         # reset prev_target_dist for distance progress reward
         # drone_pos: [len(env_ids), num_agents, 3], target_pos: [len(env_ids), 1, 3] — broadcasts naturally
         self.prev_target_dist[env_ids] = torch.norm(target_pos - drone_pos, dim=-1)
+        self.prev_expert2_role_dist[env_ids] = 0.0
+        self.prev_expert2_role_dist_ready[env_ids] = False
+        self.prev_expert2_close_triggered[env_ids] = False
+        self.expert2_prev_assignment[env_ids] = -1
+        self.expert2_assignment_ready[env_ids] = False
+        self.tp_history_buffer[env_ids] = 0.0
+        self.tp_history_initialized[env_ids] = False
+        self._expert2_cached_active_waypoint = None
+        self._expert2_cached_close_triggered = None
         goal_dist = point_to_cylinder_distance(
             target_pos.squeeze(1), self.goal_region_center, self.goal_region_radius, self.goal_region_height
         )
@@ -820,6 +1042,153 @@ class HideAndSeek(IsaacEnv):
         
         for substep in range(1):
             self.sim.step(self._should_render(substep))
+
+    def _compute_target_desired_acc(self) -> torch.Tensor:
+        forces_target = self._get_dummy_policy_prey()
+        return self.target_accel_limit * forces_target / (
+            torch.norm(forces_target, dim=-1, keepdim=True) + 1e-5
+        )
+
+    def _step_point_mass_target(self):
+        target_vel = self.target.get_velocities()
+        target_lin_vel = target_vel[..., :3]
+        desired_acc = self._compute_target_desired_acc()
+        accel_alpha = min(1.0, self.dt / max(self.target_command_tau, self.dt))
+        self.target_acc_cmd.lerp_(desired_acc, accel_alpha)
+        next_target_vel = target_lin_vel + (
+            self.target_acc_cmd - self.target_velocity_damping * target_lin_vel
+        ) * self.dt
+        next_target_vel = clip_vector_norm(next_target_vel, self.current_target_speed)
+        target_vel[..., :3] = next_target_vel
+        target_vel[..., 3:] = 0.0
+        self.target.set_velocities(target_vel.type(torch.float32), self.env_ids)
+
+    def _step_uav_target(self):
+        if self.target_controller is None:
+            raise RuntimeError("target_dynamics_mode='uav' requires a target_controller.")
+
+        target_state = self.target.get_state()[..., :13]
+        target_vel_actual = target_state[..., 7:10]
+        desired_acc = self._compute_target_desired_acc()
+        accel_alpha = min(1.0, self.dt / max(self.target_command_tau, self.dt))
+        self.target_acc_cmd.lerp_(desired_acc, accel_alpha)
+
+        prev_vel_cmd = self.target_vel_cmd.clone()
+        target_vel_cmd = self.target_vel_cmd + (
+            self.target_acc_cmd - self.target_velocity_damping * self.target_vel_cmd
+        ) * self.dt
+        self.target_vel_cmd.copy_(clip_vector_norm(target_vel_cmd, self.current_target_speed))
+
+        target_acc_ff = (self.target_vel_cmd - prev_vel_cmd) / max(float(self.dt), 1e-6)
+        target_acc_ff = clip_vector_norm(target_acc_ff, self.target_accel_limit)
+        target_acc_ff = target_acc_ff * self.target_uav_acc_feedforward_scale
+
+        goal_vec = self.goal_region_center.view(1, 1, 3) - target_state[..., :3]
+        pidrate_action = self._target_velocity_to_pidrate_action(
+            desired_vel=self.target_vel_cmd,
+            current_vel=target_vel_actual,
+            current_quat=target_state[..., 3:7],
+            feedforward_acc=target_acc_ff,
+            heading_hint=goal_vec,
+        )
+        target_rate_norm, target_thrust_norm = pidrate_action.split([3, 1], dim=-1)
+        target_rate = target_rate_norm * 180.0 * float(self.target_controller.target_clip)
+        target_thrust_ratio = torch.clamp(
+            (target_thrust_norm + 1.0) / 2.0,
+            min=float(self.target_controller.min_thrust_ratio),
+            max=float(self.target_controller.max_thrust_ratio),
+        )
+        target_thrust = target_thrust_ratio * 2**16
+
+        cmds, _ = self.target_controller(
+            target_state,
+            target_rate=target_rate,
+            target_thrust=target_thrust,
+            reset_pid=self.target_pid_reset,
+        )
+        self.target_pid_reset.fill_(False)
+        torch.nan_to_num_(cmds, 0.0)
+        self.target.apply_action(cmds.clamp(-1.0, 1.0))
+
+    def _target_velocity_to_pidrate_action(
+        self,
+        desired_vel: torch.Tensor,
+        current_vel: torch.Tensor,
+        current_quat: torch.Tensor,
+        feedforward_acc: torch.Tensor,
+        heading_hint: torch.Tensor,
+    ) -> torch.Tensor:
+        desired_vel = clip_vector_norm(desired_vel, self.current_target_speed)
+        vel_error = desired_vel - current_vel
+        acc_cmd = self.target_uav_velocity_gain * vel_error + feedforward_acc
+        acc_cmd[..., 2].clamp_(-3.5, 3.5)
+
+        max_tilt_tan = math.tan(math.radians(self.target_uav_max_tilt_deg))
+        a_xy_max = torch.clamp((9.81 + acc_cmd[..., 2:3]) * max_tilt_tan, min=0.1)
+        acc_xy = acc_cmd[..., :2]
+        acc_xy_norm = torch.norm(acc_xy, dim=-1, keepdim=True)
+        acc_cmd[..., :2] = acc_xy * (a_xy_max / acc_xy_norm.clamp(min=1e-6)).clamp(max=1.0)
+
+        e3 = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=desired_vel.dtype).view(1, 1, 3)
+        thrust_world = acc_cmd + 9.81 * e3
+        thrust_norm = torch.norm(thrust_world, dim=-1, keepdim=True).clamp(min=1e-6)
+        z_des = thrust_world / thrust_norm
+        thrust_ratio = self.target_hover_thrust_ratio * (thrust_norm / 9.81)
+        thrust_ratio = thrust_ratio.clamp(
+            float(self.target_controller.min_thrust_ratio),
+            float(self.target_controller.max_thrust_ratio),
+        )
+
+        x_cur = quat_axis(current_quat, axis=0)
+        y_cur = quat_axis(current_quat, axis=1)
+        z_cur = quat_axis(current_quat, axis=2)
+
+        x_ref = project_to_plane(x_cur, z_des)
+        fallback_x = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=desired_vel.dtype).view(1, 1, 3)
+        x_ref = torch.where(x_ref.norm(dim=-1, keepdim=True) > 1e-5, x_ref, fallback_x.expand_as(x_ref))
+
+        heading = torch.where(
+            desired_vel.norm(dim=-1, keepdim=True) > 0.05,
+            desired_vel,
+            heading_hint,
+        )
+        heading_proj = project_to_plane(heading, z_des)
+        x_ref = torch.where(
+            heading_proj.norm(dim=-1, keepdim=True) > 1e-5,
+            0.5 * x_ref + 0.5 * heading_proj,
+            x_ref,
+        )
+
+        x_des = safe_normalize(x_ref)
+        y_des = torch.linalg.cross(z_des, x_des, dim=-1)
+        fallback_y = torch.tensor([0.0, 1.0, 0.0], device=self.device, dtype=desired_vel.dtype).view(1, 1, 3)
+        y_des = torch.where(y_des.norm(dim=-1, keepdim=True) > 1e-5, y_des, fallback_y.expand_as(y_des))
+        y_des = safe_normalize(y_des)
+        x_des = safe_normalize(torch.linalg.cross(y_des, z_des, dim=-1))
+
+        e_rot = 0.5 * (
+            torch.linalg.cross(x_cur, x_des, dim=-1)
+            + torch.linalg.cross(y_cur, y_des, dim=-1)
+            + torch.linalg.cross(z_cur, z_des, dim=-1)
+        )
+        omega_world = 2.0 * e_rot
+        omega_body = quat_rotate_inverse(current_quat, omega_world)
+        omega_body = clip_vector_norm(
+            omega_body,
+            self.target_uav_rate_fraction * self.target_max_body_rate_rad_s,
+        )
+
+        stopped = desired_vel.norm(dim=-1, keepdim=True) < 1e-5
+        omega_body = torch.where(stopped, torch.zeros_like(omega_body), omega_body)
+        thrust_ratio = torch.where(
+            stopped,
+            torch.full_like(thrust_ratio, self.target_hover_thrust_ratio),
+            thrust_ratio,
+        )
+
+        rate_norm = (omega_body / max(self.target_max_body_rate_rad_s, 1e-6)).clamp(-0.999, 0.999)
+        thrust_norm_action = (2.0 * thrust_ratio - 1.0).clamp(-0.999, 0.999)
+        return torch.cat([rate_norm, thrust_norm_action], dim=-1)
 
     def _pre_sim_step(self, tensordict: TensorDictBase):   
         actions = tensordict[("agents", "action")]
@@ -838,23 +1207,169 @@ class HideAndSeek(IsaacEnv):
 
         self.effort = self.drone.apply_action(actions)
 
-        target_vel = self.target.get_velocities()
-        target_lin_vel = target_vel[..., :3]
-        forces_target = self._get_dummy_policy_prey()
-        desired_acc = self.target_accel_limit * forces_target / (torch.norm(forces_target, dim=-1, keepdim=True) + 1e-5)
-        accel_alpha = min(1.0, self.dt / max(self.target_command_tau, self.dt))
-        self.target_acc_cmd.lerp_(desired_acc, accel_alpha)
-        next_target_vel = target_lin_vel + (self.target_acc_cmd - self.target_velocity_damping * target_lin_vel) * self.dt
-        next_target_vel = clip_vector_norm(next_target_vel, self.current_target_speed)
-        target_vel[..., :3] = next_target_vel
-        target_vel[..., 3:] = 0.0
-        self.target.set_velocities(target_vel.type(torch.float32), self.env_ids)
+        if self.target_dynamics_mode == "uav":
+            self._step_uav_target()
+        else:
+            self._step_point_mass_target()
+
+    def _select_expert2_intercept_prediction(self, target_flat: torch.Tensor) -> torch.Tensor:
+        """Select the same TP prediction step used by the current Expert2 policy."""
+        pred = getattr(self, "target_pos_predicted", None)
+        if pred is None:
+            return target_flat
+        if pred.dim() == 2:
+            return pred.to(device=target_flat.device, dtype=target_flat.dtype)
+        if pred.dim() != 3 or pred.shape[1] <= 0:
+            return target_flat
+        pred_idx = max(
+            0,
+            min(
+                int(self.expert2_intercept_pred_step) - 1,
+                int(pred.shape[1]) - 1,
+            ),
+        )
+        return pred[:, pred_idx].to(device=target_flat.device, dtype=target_flat.dtype)
+
+    def _compute_expert2_role_assignment_and_targets(
+        self,
+        drone_pos: torch.Tensor,
+        target_pos: torch.Tensor,
+        target_vel: torch.Tensor,
+        target_pos_pred: Optional[torch.Tensor] = None,
+        update_assignment_state: bool = False,
+    ):
+        """Return Expert2 role ids and normal/close targets used by observations and reward."""
+        target_flat = target_pos.squeeze(1) if target_pos.dim() == 3 else target_pos
+        target_vel_flat = target_vel[..., :3]
+        if target_vel_flat.dim() == 3:
+            target_vel_flat = target_vel_flat.squeeze(1)
+
+        goal_pos = self.goal_region_center.view(1, 3).to(target_flat.device, target_flat.dtype)
+        goal_vec = goal_pos - target_flat
+        goal_dist = goal_vec.norm(dim=-1)
+        goal_dir = safe_normalize(goal_vec)
+
+        lookahead_time = torch.where(
+            goal_dist > self.expert2_role_goal_dist_switch,
+            torch.full_like(goal_dist, self.expert2_role_far_lookahead),
+            torch.full_like(goal_dist, self.expert2_role_near_lookahead),
+        )
+        if target_pos_pred is None:
+            target_pos_pred = self._select_expert2_intercept_prediction(target_flat)
+        elif target_pos_pred.dim() == 3:
+            pred_idx = max(
+                0,
+                min(
+                    int(self.expert2_intercept_pred_step) - 1,
+                    int(target_pos_pred.shape[1]) - 1,
+                ),
+            )
+            target_pos_pred = target_pos_pred[:, pred_idx]
+        target_pos_pred = target_pos_pred.to(device=target_flat.device, dtype=target_flat.dtype)
+        if self.expert2_intercept_use_direct_pred:
+            intercept_seed = target_pos_pred
+        else:
+            intercept_seed = target_pos_pred + target_vel_flat * lookahead_time.unsqueeze(-1)
+
+        motion_hint = target_vel_flat.clone()
+        motion_norm = motion_hint.norm(dim=-1)
+        motion_hint = torch.where(
+            (motion_norm < 1e-4).unsqueeze(-1),
+            intercept_seed - target_flat,
+            motion_hint,
+        )
+        motion_norm = motion_hint.norm(dim=-1)
+        motion_hint = torch.where(
+            (motion_norm < 1e-4).unsqueeze(-1),
+            goal_dir,
+            motion_hint,
+        )
+        forward_dir = safe_normalize(motion_hint)
+
+        up = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=drone_pos.dtype).view(1, 3)
+        lateral = torch.linalg.cross(up.expand_as(forward_dir), forward_dir, dim=-1)
+        fallback_lateral = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=drone_pos.dtype).view(1, 3)
+        lateral = torch.where(
+            lateral.norm(dim=-1, keepdim=True) > 1e-5,
+            lateral,
+            fallback_lateral.expand_as(lateral),
+        )
+        lateral = safe_normalize(lateral)
+
+        rear = intercept_seed - self.expert2_role_rear_back * forward_dir
+        front_left = intercept_seed + self.expert2_role_front_side * lateral
+        front_right = intercept_seed - self.expert2_role_front_side * lateral
+        anchors = torch.stack([rear, front_left, front_right], dim=1)
+
+        dist = torch.cdist(drone_pos, anchors)
+        batch_size = drone_pos.shape[0]
+        perm = self.expert2_role_permutations.unsqueeze(0).expand(batch_size, -1, -1)
+        dist_expanded = dist.unsqueeze(1).expand(-1, perm.shape[1], -1, -1)
+        assigned = torch.gather(dist_expanded, 3, perm.unsqueeze(-1)).squeeze(-1)
+        cost = assigned.sum(dim=-1)
+        if self.expert2_prev_assignment.shape[0] == batch_size:
+            ready = self.expert2_assignment_ready.squeeze(-1)
+            changed = (perm != self.expert2_prev_assignment.unsqueeze(1)).float().sum(dim=-1)
+            cost = cost + 0.20 * changed * ready.float().unsqueeze(-1)
+        assignment = perm[
+            torch.arange(batch_size, device=self.device),
+            cost.argmin(dim=-1),
+        ]
+        if update_assignment_state and self.expert2_prev_assignment.shape[0] == batch_size:
+            self.expert2_prev_assignment.copy_(assignment)
+            self.expert2_assignment_ready.fill_(True)
+        normal_targets = torch.gather(anchors, 1, assignment.unsqueeze(-1).expand(-1, -1, 3))
+        role_dist_normal = torch.norm(normal_targets - drone_pos, dim=-1)
+
+        is_chaser = assignment == 0
+        dist_to_target = torch.norm(drone_pos - target_flat.unsqueeze(1), dim=-1)
+        target_close_threshold = torch.where(
+            is_chaser,
+            torch.full_like(role_dist_normal, self.expert2_role_chaser_close_target_threshold),
+            torch.full_like(role_dist_normal, self.expert2_role_front_close_target_threshold),
+        )
+        close_triggered = (
+            (role_dist_normal < self.expert2_role_close_wp_threshold)
+            | (dist_to_target < target_close_threshold)
+        )
+        if not self.expert2_role_close_enabled:
+            close_triggered = torch.zeros_like(close_triggered, dtype=torch.bool)
+
+        side_axis = project_to_plane(
+            normal_targets - target_flat.unsqueeze(1),
+            forward_dir.unsqueeze(1),
+        )
+        side_axis = torch.where(
+            side_axis.norm(dim=-1, keepdim=True) > 1e-5,
+            safe_normalize(side_axis),
+            torch.zeros_like(side_axis),
+        )
+        close_chaser = target_pos_pred.unsqueeze(1) - self.expert2_role_close_chaser_back * forward_dir.unsqueeze(1)
+        close_interceptor = (
+            target_pos_pred.unsqueeze(1)
+            + self.expert2_role_close_front_forward * forward_dir.unsqueeze(1)
+            + self.expert2_role_close_front_side * side_axis
+        )
+        close_targets = torch.where(is_chaser.unsqueeze(-1), close_chaser, close_interceptor)
+        active_targets = torch.where(close_triggered.unsqueeze(-1), close_targets, normal_targets)
+
+        return (
+            assignment,
+            normal_targets,
+            close_targets,
+            close_triggered,
+            active_targets,
+            forward_dir,
+            lateral,
+        )
      
     def _compute_state_and_obs(self):
         self.drone_states = self.drone.get_state()
         self.info["drone_state"][:] = self.drone_states[..., :13]
-        drone_pos, _ = self.get_env_poses(self.drone.get_world_poses())
-        drone_vel = self.drone.get_velocities()[..., :3]
+        drone_pos, drone_quat = self.get_env_poses(self.drone.get_world_poses())
+        drone_vel_full = self.drone.get_velocities()
+        drone_vel = drone_vel_full[..., :3]
+        drone_body_rates = quat_rotate_inverse(drone_quat, drone_vel_full[..., 3:6])
         self.drone_rpos = vmap(off_diag)(vmap(cpos)(drone_pos, drone_pos))
         self.drone_rvel = vmap(off_diag)(vmap(cpos)(drone_vel, drone_vel))
 
@@ -862,16 +1377,11 @@ class HideAndSeek(IsaacEnv):
 
         target_pos, _ = self.get_env_poses(self.target.get_world_poses())
         target_vel = self.target.get_velocities()
+        self.info["target_state"][..., :3] = target_pos
+        self.info["target_state"][..., 3:6] = target_vel[..., :3]
         target_rpos = vmap(cpos)(drone_pos, target_pos)
         in_detection_range = torch.norm(target_rpos, dim=-1) < self.drone_detect_radius
         self.broadcast_detect = torch.any(in_detection_range, dim=1)
-
-        target_rpos_norm = target_rpos / self.position_scale.view(1, 1, 1, 3)
-        target_rpos_mask = (~self.broadcast_detect).unsqueeze(-1).unsqueeze(-1).expand_as(target_rpos_norm)
-        target_rpos_masked = target_rpos_norm.clone()
-        target_rpos_masked.masked_fill_(target_rpos_mask, self.mask_value)
-
-        t = (self.progress_buf / self.max_episode_length).unsqueeze(-1).unsqueeze(-1)
 
         target_mask = (~self.broadcast_detect).unsqueeze(-1).expand_as(target_pos)
         target_pos_norm = target_pos / self.position_scale.view(1, 1, 3)
@@ -882,12 +1392,6 @@ class HideAndSeek(IsaacEnv):
         target_vel_masked.masked_fill_(target_mask, self.mask_value)
 
         TP = TensorDict({}, [self.num_envs])
-        target_rpos_predicted = torch.zeros(
-            self.num_envs,
-            self.num_agents,
-            3 * self.future_predcition_step,
-            device=self.device,
-        )
 
         if self.use_TP_net:
             expanded_drone_pos = torch.concat(
@@ -896,22 +1400,54 @@ class HideAndSeek(IsaacEnv):
             frame_state = torch.concat(
                 [
                     self.progress_buf.unsqueeze(-1) / max(self.max_episode_length, 1),
-                    target_pos_masked.reshape(self.num_envs, -1),
-                    target_vel_masked.squeeze(1),
+                    target_pos_norm.reshape(self.num_envs, -1),
+                    target_vel_norm.squeeze(1),
                     expanded_drone_pos.reshape(self.num_envs, -1),
                 ],
                 dim=-1,
             )
-            if len(self.history_data) < self.history_step:
-                for _ in range(self.history_step):
-                    self.history_data.append(frame_state)
-            else:
-                self.history_data.append(frame_state)
+            if (
+                self.tp_history_buffer.shape[0] != self.num_envs
+                or self.tp_history_buffer.shape[1] != self.history_step
+                or self.tp_history_buffer.shape[2] != frame_state.shape[-1]
+            ):
+                self.tp_history_buffer = torch.zeros(
+                    self.num_envs,
+                    self.history_step,
+                    frame_state.shape[-1],
+                    device=self.device,
+                    dtype=frame_state.dtype,
+                )
+                self.tp_history_initialized = torch.zeros(
+                    self.num_envs,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
 
-            TP["TP_input"] = torch.stack(list(self.history_data), dim=1).to(self.device)
-            self.target_pos_predicted = self.TP(TP["TP_input"]).reshape(
-                self.num_envs, self.future_predcition_step, -1
-            )
+            # Initialized envs: shift history and append latest frame.
+            initialized = self.tp_history_initialized
+            if bool(initialized.any()):
+                self.tp_history_buffer[initialized] = torch.roll(
+                    self.tp_history_buffer[initialized], shifts=-1, dims=1
+                )
+                self.tp_history_buffer[initialized, -1] = frame_state[initialized]
+
+            # Freshly reset envs: bootstrap full history with current frame.
+            fresh = ~initialized
+            if bool(fresh.any()):
+                self.tp_history_buffer[fresh] = frame_state[fresh].unsqueeze(1).expand(
+                    -1, self.history_step, -1
+                )
+                self.tp_history_initialized[fresh] = True
+
+            TP["TP_input"] = self.tp_history_buffer.clone()
+            # Environment observations use TP as a predictor, not as part of
+            # the rollout computation graph. Keeping this under no_grad avoids
+            # evaluation-time graph accumulation and CUDA OOM.
+            with torch.no_grad():
+                self.target_pos_predicted = self.TP(TP["TP_input"]).reshape(
+                    self.num_envs, self.future_predcition_step, -1
+                )
             self.target_pos_predicted[..., :2] = self.target_pos_predicted[..., :2] * self.arena_size
             self.target_pos_predicted[..., 2] = (
                 (self.target_pos_predicted[..., 2] + 1.0) / 2.0 * self.max_height
@@ -925,10 +1461,6 @@ class HideAndSeek(IsaacEnv):
             TP["TP_groundtruth"] = target_pos.squeeze(1).clone()
             TP["TP_groundtruth"][..., :2] = TP["TP_groundtruth"][..., :2] / self.arena_size
             TP["TP_groundtruth"][..., 2] = TP["TP_groundtruth"][..., 2] / self.max_height * 2.0 - 1.0
-            target_rpos_predicted = (
-                (drone_pos.unsqueeze(2) - self.target_pos_predicted.unsqueeze(1))
-                / self.position_scale.view(1, 1, 1, 3)
-            ).reshape(self.num_envs, self.num_agents, -1)
             tp_escape_dir = safe_normalize(self.target_pos_predicted[:, 0] - target_pos.squeeze(1))
         else:
             self.target_pos_predicted = None
@@ -989,41 +1521,82 @@ class HideAndSeek(IsaacEnv):
             self.di_scale,
         )
 
-        goal_threat_dir_expand = goal_threat_dir.unsqueeze(1).expand(-1, self.num_agents, -1)
-        tp_escape_dir_expand = tp_escape_dir.unsqueeze(1).expand(-1, self.num_agents, -1)
-        cooperation = torch.cat(
+        if self.target_pos_predicted is not None:
+            target_pred_world = self.target_pos_predicted
+        else:
+            target_pred_world = target_pos_flat.unsqueeze(1).expand(
+                -1, self.future_predcition_step, -1
+            )
+
+        (
+            role_assignment,
+            assigned_waypoint_world,
+            close_waypoint_world,
+            close_triggered,
+            _active_waypoint_world,
+            forward_dir_world,
+            lateral_world,
+        ) = self._compute_expert2_role_assignment_and_targets(
+            drone_pos,
+            target_pos,
+            target_vel[..., :3],
+            target_pos_pred=self._select_expert2_intercept_prediction(target_pos_flat),
+            update_assignment_state=True,
+        )
+        self._expert2_cached_active_waypoint = _active_waypoint_world.detach()
+        self._expert2_cached_close_triggered = close_triggered.detach()
+
+        if self.role_encoding_dim > 0:
+            role_encoding = torch.zeros(
+                self.num_envs,
+                self.num_agents,
+                self.role_encoding_dim,
+                device=self.device,
+                dtype=drone_pos.dtype,
+            )
+            role_encoding.scatter_(-1, role_assignment.unsqueeze(-1), 1.0)
+        else:
+            role_encoding = torch.zeros(
+                self.num_envs,
+                self.num_agents,
+                0,
+                device=self.device,
+                dtype=drone_pos.dtype,
+            )
+
+        cooperation_env = torch.cat(
             [
-                coverage_quality.unsqueeze(-1),
-                goal_threat_dir_expand,
-                tp_escape_dir_expand,
-                (self.my_ahead_proj_goal / self.goal_distance_norm).unsqueeze(-1),
-                (self.my_ahead_proj_tp / self.goal_distance_norm).unsqueeze(-1),
-                (self.my_lateral_dist_goal / self.goal_distance_norm).unsqueeze(-1),
+                target_vel[..., :3].squeeze(1),
+                target_pred_world.reshape(self.num_envs, -1),
+                forward_dir_world,
+                lateral_world,
             ],
             dim=-1,
-        ).unsqueeze(2)
+        )
+        cooperation = cooperation_env.unsqueeze(1).expand(-1, self.num_agents, -1).unsqueeze(2)
         obs["cooperation"] = cooperation
 
         obs["state_self"] = torch.cat(
             [
-                target_rpos_masked.reshape(self.num_envs, self.num_agents, -1),
-                target_rpos_predicted,
-                self.drone_states[..., 3:10],
-                self.drone_states[..., 13:19],
-                t.expand(-1, self.num_agents, self.time_encoding_dim),
+                drone_pos,
+                drone_vel,
+                drone_body_rates,
+                drone_quat,
+                assigned_waypoint_world,
+                close_waypoint_world,
+                close_triggered.unsqueeze(-1).to(drone_pos.dtype),
+                role_encoding,
             ],
             dim=-1,
         ).unsqueeze(2)
 
         if self.drone.n > 1:
-            j_ahead_proj_goal = vmap(others)(self.my_ahead_proj_goal) / self.goal_distance_norm
-            j_dist_to_target = vmap(others)(self.target_dist) / self.goal_distance_norm
+            other_role_encoding = vmap(others)(role_encoding)
             obs["state_others"] = torch.cat(
                 [
-                    self.drone_rpos / self.position_scale.view(1, 1, 1, 3),
-                    self.drone_rvel / self.velocity_scale,
-                    j_ahead_proj_goal.unsqueeze(-1),
-                    j_dist_to_target.unsqueeze(-1),
+                    -self.drone_rpos,
+                    -self.drone_rvel,
+                    other_role_encoding,
                 ],
                 dim=-1,
             )
@@ -1039,11 +1612,7 @@ class HideAndSeek(IsaacEnv):
         state = TensorDict({}, [self.num_envs])
         state["state_drones"] = torch.cat(
             [
-                target_rpos_norm.reshape(self.num_envs, self.num_agents, -1),
-                target_rpos_predicted,
-                self.drone_states[..., 3:10],
-                self.drone_states[..., 13:19],
-                t.expand(-1, self.num_agents, self.time_encoding_dim),
+                obs["state_self"].squeeze(2),
                 cooperation.squeeze(2),
             ],
             dim=-1,
@@ -1074,9 +1643,66 @@ class HideAndSeek(IsaacEnv):
             self.batch_size,
         )
 
+    def _compute_expert2_waypoint_rewards(
+        self,
+        drone_pos: torch.Tensor,
+        target_pos: torch.Tensor,
+        target_vel: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return per-agent step rewards for normal-waypoint mode and close-waypoint mode."""
+        cached_targets = getattr(self, "_expert2_cached_active_waypoint", None)
+        cached_close = getattr(self, "_expert2_cached_close_triggered", None)
+        if (
+            cached_targets is not None
+            and cached_close is not None
+            and cached_targets.shape == drone_pos.shape
+            and cached_close.shape == drone_pos.shape[:2]
+        ):
+            role_targets = cached_targets.to(device=drone_pos.device, dtype=drone_pos.dtype)
+            close_triggered = cached_close.to(device=drone_pos.device)
+        else:
+            target_flat = target_pos.squeeze(1) if target_pos.dim() == 3 else target_pos
+            (
+                _assignment,
+                _normal_targets,
+                _close_targets,
+                close_triggered,
+                role_targets,
+                _forward_dir,
+                _lateral,
+            ) = self._compute_expert2_role_assignment_and_targets(
+                drone_pos,
+                target_pos,
+                target_vel,
+                target_pos_pred=self._select_expert2_intercept_prediction(target_flat),
+                update_assignment_state=False,
+            )
+        role_dist = torch.norm(role_targets - drone_pos, dim=-1)
+        ready_mask = self.prev_expert2_role_dist_ready.expand_as(role_dist)
+        mode_switch = (~ready_mask) | (close_triggered != self.prev_expert2_close_triggered)
+        prev_role_dist = torch.where(ready_mask, self.prev_expert2_role_dist, role_dist)
+        effective_prev_role_dist = torch.where(mode_switch, role_dist, prev_role_dist)
+        role_progress = effective_prev_role_dist - role_dist
+        self.prev_expert2_role_dist.copy_(role_dist)
+        self.prev_expert2_role_dist_ready.fill_(True)
+        self.prev_expert2_close_triggered.copy_(close_triggered)
+
+        normal_reward = (
+            self.expert2_role_reward_coef
+            * torch.tanh(role_progress / max(self.expert2_role_reward_scale, 1e-6))
+            * (~close_triggered).float()
+        )
+        close_reward = (
+            self.expert2_close_reward_coef
+            * torch.tanh(role_progress / max(self.expert2_close_reward_scale, 1e-6))
+            * close_triggered.float()
+        )
+        return normal_reward, close_reward
+
     def _compute_reward_and_done(self):
         drone_pos, _ = self.get_env_poses(self.drone.get_world_poses())
         target_pos, _ = self.get_env_poses(self.target.get_world_poses())
+        target_vel = self.target.get_velocities()[..., :3].squeeze(1)
 
         target_dist = torch.norm(target_pos - drone_pos, dim=-1)
         goal_dist = point_to_cylinder_distance(
@@ -1106,13 +1732,23 @@ class HideAndSeek(IsaacEnv):
 
         drone_vel = self.drone.get_velocities()
         drone_speed_norm = torch.norm(drone_vel[..., :3], dim=-1)
-        speed_excess = torch.relu(drone_speed_norm / max(self.cfg.task.v_drone, 1e-6) - 1.0)
+        speed_excess = torch.relu(drone_speed_norm / max(self.current_pursuer_speed, 1e-6) - 1.0)
         speed_reward = -self.speed_coef * speed_excess
 
         drone_pos_dist = torch.norm(self.drone_rpos, dim=-1)
         collision_drone = (drone_pos_dist < 2.0 * self.collision_radius).float().sum(-1)
         self.stats["collision_drone"].add_(collision_drone.mean(-1).unsqueeze(-1))
         self.stats["pursuer_collisions_count"].add_((collision_drone.sum(-1) / 2).unsqueeze(-1))
+        closest_drone_dist = drone_pos_dist.min(dim=-1).values
+        soft_separation_span = max(self.soft_separation_start - self.soft_separation_end, 1e-6)
+        soft_separation_ratio = (
+            (self.soft_separation_start - closest_drone_dist) / soft_separation_span
+        ).clamp(0.0, 1.0)
+        separation_penalty = (
+            -self.soft_separation_penalty_coef
+            * soft_separation_ratio
+            * (collision_drone == 0).float()
+        )
 
         collision_wall = (
             (drone_pos[..., -1] > self.max_height).float()
@@ -1138,13 +1774,15 @@ class HideAndSeek(IsaacEnv):
         landed_penalty = -self.landed_penalty_coef * any_landed.expand_as(target_dist).float()
         self.stats["any_landed"].add_(any_landed.float())
 
+        drone_collision_done = (collision_drone > 0).any(dim=1, keepdim=True)
         timeout = (
             (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
             & ~capture_done
             & ~goal_reached
             & ~any_landed
+            & ~drone_collision_done
         )
-        capture_before_goal = capture_done & ~goal_reached & ~any_landed
+        capture_before_goal = capture_done & ~goal_reached & ~any_landed & ~drone_collision_done
         catch_reward = self.catch_reward_coef * capture_before_goal.expand_as(target_dist).float()
         goal_penalty_val = -self.goal_penalty_coef * goal_reached.expand_as(target_dist).float()
         timeout_penalty_val = -self.timeout_penalty_coef * timeout.expand_as(target_dist).float()
@@ -1163,19 +1801,63 @@ class HideAndSeek(IsaacEnv):
 
         airborne_mask = (drone_pos[..., -1] > self.landed_z_threshold).float()
         smoothness_reward = self.smoothness_coef * (torch.exp(-self.action_error_order1) - 1.0) * airborne_mask
-        time_penalty = -self.time_penalty_coef * torch.ones_like(target_dist)
+        # Penalize longer episodes more strongly while keeping the maximum
+        # per-step scale controlled by time_penalty_coef.
+        step_fraction = (
+            self.progress_buf.unsqueeze(-1).float()
+            / max(float(self.max_episode_length), 1.0)
+        ).clamp(0.0, 1.0)
+        time_penalty = -self.time_penalty_coef * step_fraction.expand_as(target_dist)
 
-        reward = (
-            terminal_reward
-            + goal_progress_reward_val.expand(-1, self.num_agents)
-            + capture_progress_reward_val.expand(-1, self.num_agents)
-            + coop_reward
-            + collision_penalty
-            + landed_penalty
-            + speed_reward
-            + smoothness_reward
-            + time_penalty
+        spread_reward = self.spread_reward_coef * self.phi_spread.unsqueeze(-1).expand(-1, self.num_agents)
+        role_reward, close_reward = self._compute_expert2_waypoint_rewards(
+            drone_pos,
+            target_pos,
+            target_vel,
         )
+
+        if self.reward_profile == "expert2_minimal":
+            drone_collision_binary = (collision_drone > 0).float()
+            reward_collision_penalty = -self.collision_coef * drone_collision_binary
+            reward = (
+                catch_reward
+                + goal_penalty_val
+                + timeout_penalty_val
+                + reward_collision_penalty
+                + landed_penalty
+                + spread_reward
+                + close_reward
+                + time_penalty
+            )
+            terminal_reward = catch_reward + goal_penalty_val + timeout_penalty_val
+            collision_penalty = reward_collision_penalty
+        elif self.reward_profile == "expert2_role":
+            drone_collision_binary = (collision_drone > 0).float()
+            reward_collision_penalty = -self.collision_coef * drone_collision_binary
+            reward = (
+                catch_reward
+                + goal_penalty_val
+                + timeout_penalty_val
+                + separation_penalty
+                + role_reward
+                + close_reward
+                + reward_collision_penalty
+                + landed_penalty
+            )
+            terminal_reward = catch_reward + goal_penalty_val + timeout_penalty_val
+            collision_penalty = reward_collision_penalty + separation_penalty
+        else:
+            reward = (
+                terminal_reward
+                + goal_progress_reward_val.expand(-1, self.num_agents)
+                + capture_progress_reward_val.expand(-1, self.num_agents)
+                + coop_reward
+                + collision_penalty
+                + landed_penalty
+                + speed_reward
+                + smoothness_reward
+                + time_penalty
+            )
 
         self.stats["success"].copy_(
             torch.logical_or(capture_before_goal, self.stats["success"].bool()).float()
@@ -1196,6 +1878,9 @@ class HideAndSeek(IsaacEnv):
         self.stats["speed_reward"].add_(speed_reward.mean(-1).unsqueeze(-1))
         self.stats["time_penalty"].add_(time_penalty.mean(-1).unsqueeze(-1))
         self.stats["coop_reward"].add_(coop_reward.mean(-1).unsqueeze(-1))
+        self.stats["spread_reward"].add_(spread_reward.mean(-1).unsqueeze(-1))
+        self.stats["close_reward"].add_(close_reward.mean(-1).unsqueeze(-1))
+        self.stats["role_reward"].add_(role_reward.mean(-1).unsqueeze(-1))
         self.stats["phi_team"].add_(self.phi_team.unsqueeze(-1))
         self.stats["phi_block"].add_(self.phi_block.unsqueeze(-1))
         self.stats["phi_pressure"].add_(self.phi_pressure.unsqueeze(-1))
@@ -1207,6 +1892,7 @@ class HideAndSeek(IsaacEnv):
         n_agents_ahead = (self.my_ahead_proj_goal > 0).float().sum(dim=1, keepdim=True)
         self.stats["n_agents_ahead_mean"].add_(n_agents_ahead)
         self.stats["collision_penalty"].add_(collision_penalty.mean(-1).unsqueeze(-1))
+        self.stats["separation_penalty"].add_(separation_penalty.mean(-1).unsqueeze(-1))
         self.stats["landed_penalty"].add_(landed_penalty.mean(-1).unsqueeze(-1))
         self.stats["smoothness_reward"].add_(smoothness_reward.mean(-1).unsqueeze(-1))
         self.stats["smoothness_mean"].add_(self.drone.throttle_difference.mean(-1).unsqueeze(-1))
@@ -1217,7 +1903,7 @@ class HideAndSeek(IsaacEnv):
             )
         )
 
-        done = timeout | capture_before_goal | goal_reached | any_landed
+        done = timeout | capture_before_goal | goal_reached | any_landed | drone_collision_done
         self._update_curriculum_metrics(done, capture_before_goal)
 
         ep_len = torch.clamp(self.progress_buf.unsqueeze(-1), min=1)
@@ -1235,6 +1921,9 @@ class HideAndSeek(IsaacEnv):
             "speed_reward",
             "time_penalty",
             "coop_reward",
+            "spread_reward",
+            "close_reward",
+            "role_reward",
             "phi_team",
             "phi_block",
             "phi_pressure",
@@ -1244,6 +1933,7 @@ class HideAndSeek(IsaacEnv):
             "urgent_block_rate",
             "n_agents_ahead_mean",
             "collision_penalty",
+            "separation_penalty",
             "collision_wall",
             "collision_floor",
             "collision_drone",
@@ -1280,10 +1970,10 @@ class HideAndSeek(IsaacEnv):
         force_goal = self.target_goal_attraction_coef * goal_offset / (goal_dist + 1e-5)
         force += force_goal
 
-        # pursuer repulsion
+        # pursuer repulsion (scaled by target_repulsion_coef)
         dist_pos = torch.norm(target_rpos, dim=-1).squeeze(1).unsqueeze(-1)
         force_r_xy_direction = - target_rpos / (dist_pos + 1e-5)
-        force_p = force_r_xy_direction * (1 / (dist_pos + 1e-5))
+        force_p = self.target_repulsion_coef * force_r_xy_direction * (1 / (dist_pos + 1e-5))
         force += torch.sum(force_p, dim=1)
 
         # region-boundary repulsion
@@ -1301,9 +1991,9 @@ class HideAndSeek(IsaacEnv):
         higher_than_z = (target_pos[..., 2] > self.max_height)
         force_region[...,2] = higher_than_z.float() * (-1 / 1e-5) + \
             (~higher_than_z).float() * - (self.max_height - target_pos[..., 2]) / ((self.max_height - target_pos[..., 2])**2 + 1e-5)
-        lower_than_ground = (target_pos[..., 2] < 0.0)
+        lower_than_ground = (target_pos[..., 2] < self.target_min_z)
         force_region[...,2] += (lower_than_ground.float() * (1 / 1e-5) + \
-            (~lower_than_ground).float() * - (0.0 - target_pos[..., 2]) / ((0.0 - target_pos[..., 2])**2 + 1e-5))
+            (~lower_than_ground).float() * - (self.target_min_z - target_pos[..., 2]) / ((self.target_min_z - target_pos[..., 2])**2 + 1e-5))
         force += force_region
 
         return force.type(torch.float32)

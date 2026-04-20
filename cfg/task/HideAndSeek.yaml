@@ -7,7 +7,7 @@ defaults:
 
 env:
   num_envs: 100
-  max_episode_length: 800
+  max_episode_length: 1200
 
 drone_model: Crazyflie
 force_sensor: false
@@ -21,8 +21,9 @@ num_agents: 3
 
 # flag
 use_partial_obs: 1
-use_eval: 1 # eval keeps fixed goal-defense layout; training goal-defense uses curriculum reset when enabled
+use_eval: 1 # eval/training both use the front_box random reset when configured below
 scenario_flag: 'goal_defense'
+use_role_encoding: true
 
 # TP net param
 history_step: 10
@@ -30,47 +31,81 @@ future_predcition_step: 5
 window_step: 1
 
 curriculum:
-  enabled: true
-  eval_uses_fixed_layout: true
+  # Curriculum promotion is disabled. This block now defines the single
+  # front-box random reset profile used by both training and evaluation.
+  enabled: false
+  start_stage: 1
+  eval_uses_fixed_layout: false
+  eval_promote:
+    enabled: false
+    after_actor_freeze: true
+    success_threshold: 0.80
+    max_pursuer_collisions_count: 1.0
+    consecutive_evals: 5
   ema_alpha: 0.10
   min_stage_episodes: 100
+  pursuer_spawn_mode: front_box
+  goal_side_angle_deg: 65.0
+  goal_side_angle_jitter_deg: 10.0
   target_spawn_x: [-0.9, -0.2]
   target_spawn_y: [-1.0, 1.0]
+  front_box_target_x: [-3.0, -2.5]
+  front_box_target_y: [-1.0, 1.0]
+  front_box_drone_x: [1.0, 2.0]
+  front_box_drone_y: [-1.0, 1.0]
+  front_box_max_z_diff: 1.0
   target_z_jitter: 0.15
   drone_z_jitter: 0.15
-  drone_min_separation: 0.30
+  drone_min_separation: 0.70
   max_sample_attempts: 64
   stages:
-    - pursuer_target_dist: [0.3, 0.8]
-      target_speed: 0.5
-      promote_success: 0.60
-      promote_capture_step: 400
-    - pursuer_target_dist: [0.5, 1.5]
-      target_speed: 0.8
-      promote_success: 0.50
-    - pursuer_target_dist: [1.0, 2.5]
-      target_speed: 1.0
+    - pursuer_target_dist: [2.0, 3.5]
+      pursuer_speed: 1.5
+      target_speed: 1.5
 
-arena_size: 2.5
+arena_size: 3.5
 max_height: 5.0
-v_drone: 1.0
+v_drone: 1.5
 v_prey: 1.0
 
 # normalized goal-defense reward
 # First priority: actually catch the target.
 # Dense shaping is kept, but weakened so it helps the chase
 # instead of replacing the real task objective.
-catch_reward_coef: 40.0
-goal_penalty_coef: 20.0
+catch_reward_coef: 50.0
+goal_penalty_coef: 40.0
 timeout_penalty_coef: 8.0
-goal_progress_coef: 0.15
-capture_progress_coef: 0.30
+reward_profile: expert2_role
+spread_reward_coef: 0.0
+goal_progress_coef: 0.0
+capture_progress_coef: 0.0
 goal_progress_scale: 0.05
 capture_progress_scale: 0.05
-coop_phi_coef: 0.08
-coop_diff_coef: 0.18
-coop_reward_init: 0.20
-coop_reward_final: 0.08
+expert2_role_reward_coef: 0.30
+expert2_role_reward_scale: 0.05
+expert2_close_reward_coef: 0.30
+expert2_close_reward_scale: 0.05
+expert2_role_front_side: 0.40
+expert2_role_rear_back: 0.30
+expert2_role_close_enabled: true
+expert2_role_goal_dist_switch: 1.40
+expert2_role_far_lookahead: 0.18
+expert2_role_near_lookahead: 0.10
+expert_intercept_pred_step: 5
+expert_intercept_use_direct_pred: false
+expert2_role_close_wp_threshold: 0.45
+expert2_role_chaser_close_target_threshold: 0.95
+expert2_role_front_close_target_threshold: 0.75
+expert2_role_close_chaser_back: 0.10
+expert2_role_close_front_forward: 0.03
+expert2_role_close_front_side: 0.24
+soft_separation_start: 0.40
+soft_separation_end: 0.20
+soft_separation_penalty_coef: 2.0
+coop_phi_coef: 0.0
+coop_diff_coef: 0.0
+coop_reward_init: 0.0
+coop_reward_final: 0.0
 coop_anneal_portion: 0.50
 di_scale: 0.15
 urgent_goal_dist: 0.80
@@ -80,24 +115,32 @@ block_softness: 0.10
 block_between_softness: 0.15
 block_lateral_scale: 0.35
 pressure_dist_scale: 0.80
-collision_coef: 2.0
-speed_coef: 0.05
+collision_coef: 40.0
+speed_coef: 0.0
 smoothness_coef: 0.0
-time_penalty_coef: 0.005
+time_penalty_coef: 0.0
 ground_collision_height: 0.10
-landed_z_threshold: 0.12
+landed_z_threshold: 0.01
 landed_speed_threshold: 0.10
-landed_penalty_coef: 8.0
+landed_penalty_coef: 40.0
 
 # goal-defense target dynamics
 goal_region_radius: 0.5
-goal_region_height: 2.0
+goal_region_height: 1.0
 goal_region_center: [2.0, 0.0, 2.5]
+target_dynamics_mode: uav  # point_mass: bounded sphere integrator; uav: APF velocity/acc command through multirotor dynamics
+target_drone_model: Crazyflie
 target_goal_attraction_coef: 1.0
 target_accel_limit: 2.0
+target_repulsion_coef: 1.0
 target_velocity_damping: 0.25
 target_command_tau: 0.15
+target_uav_velocity_gain: 3.2
+target_uav_max_tilt_deg: 25.0
+target_uav_rate_fraction: 0.65
+target_uav_acc_feedforward_scale: 0.50
 target_physics_max_velocity: 5.0
+target_min_z: 0.2
 
 # env param
 catch_radius: 0.4

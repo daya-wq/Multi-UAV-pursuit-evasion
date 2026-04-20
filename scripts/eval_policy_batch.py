@@ -23,13 +23,15 @@ from omni_drones.learning import MAPPOPolicy
 
 _extra_parser = argparse.ArgumentParser(add_help=False)
 _extra_parser.add_argument("--model_dir", required=True)
+_extra_parser.add_argument("--tp_model_dir", default="")
 _extra_parser.add_argument("--n_eval", type=int, default=2048)
 _extra_parser.add_argument("--batch_envs", type=int, default=2048)
-_extra_parser.add_argument("--episode_length", type=int, default=1000)
+_extra_parser.add_argument("--episode_length", type=int, default=1200)
 _extra_parser.add_argument("--v_prey_test", type=float, default=1.5)
 _extra_parser.add_argument("--v_drone_test", type=float, default=1.5)
 _extra_parser.add_argument("--random_init", type=lambda x: x.lower() != "false", default=True)
 _extra_parser.add_argument("--seed_base", type=int, default=999)
+_extra_parser.add_argument("--deterministic", type=lambda x: x.lower() != "false", default=True)
 _extra_args, _remaining_argv = _extra_parser.parse_known_args()
 sys.argv = [sys.argv[0]] + _remaining_argv
 
@@ -118,7 +120,8 @@ def carry_actor_rnn_state(policy, src_td: TensorDict, dst_td: TensorDict):
         dst_td[rnn_key] = src_td[rnn_key].detach()
 
 
-def run_policy_wave(env, base_env, policy, max_steps: int):
+@torch.no_grad()
+def run_policy_wave(env, base_env, policy, max_steps: int, deterministic: bool = True):
     tensordict = env.reset()
     device = base_env.device
     n_envs = int(base_env.num_envs)
@@ -150,7 +153,7 @@ def run_policy_wave(env, base_env, policy, max_steps: int):
                 min_goal_dist_seen[env_idx], float(goal_dist_all[env_idx].item())
             )
 
-        action_td = policy(tensordict, deterministic=True)
+        action_td = policy(tensordict, deterministic=deterministic)
         if bool(done_mask.any()):
             action_td["agents", "action"][done_mask] = zero_action[done_mask]
 
@@ -292,7 +295,8 @@ def main(cfg):
             from omni_drones.controllers import PIDRateController as _PIDRateController
             from omni_drones.utils.torchrl.transforms import PIDRateController
             controller = _PIDRateController(cfg.sim.dt, 9.81, base_env.drone.params).to(base_env.device)
-            transforms.append(PIDRateController(controller))
+            actor_has_tanh = bool(cfg.algo.actor.get("tanh", False))
+            transforms.append(PIDRateController(controller, actor_has_tanh=actor_has_tanh))
         elif not action_transform.lower() == "none":
             raise NotImplementedError(f"Unknown action transform: {action_transform}")
 
@@ -323,6 +327,15 @@ def main(cfg):
     agent_spec: AgentSpec = env.agent_spec["drone"]
     policy = MAPPOPolicy(cfg.algo, agent_spec=agent_spec, device=cfg.sim.device, TP_net=base_env.TP)
     policy.load_state_dict(state_dict)
+    if args.tp_model_dir:
+        tp_state = torch.load(args.tp_model_dir, map_location=cfg.sim.device, weights_only=False)
+        if isinstance(tp_state, dict) and "TP" in tp_state:
+            tp_state = tp_state["TP"]
+        policy.TP_net.load_state_dict(tp_state)
+    try:
+        policy.actor.module.encoder.transformer.use_nested_tensor = False
+    except Exception:
+        pass
     if hasattr(policy, "actor"):
         policy.actor.eval()
     if hasattr(policy, "critic"):
@@ -331,10 +344,21 @@ def main(cfg):
         policy.TP_net.eval()
 
     print(f"[Policy eval] model={args.model_dir}")
+    print(f"[Policy eval] tp_model={args.tp_model_dir or '<from model checkpoint>'}")
+    if hasattr(base_env, "curriculum_stages"):
+        stage_cfg = base_env.curriculum_stages[base_env.curriculum_stage]
+        dist_min, dist_max = stage_cfg["distance_range"]
+        print(
+            f"[Policy eval] curriculum_stage={base_env.curriculum_stage + 1} "
+            f"distance_range=({dist_min:.2f}, {dist_max:.2f}) "
+            f"pursuer_speed={base_env.current_pursuer_speed:.2f} "
+            f"target_speed={base_env.current_target_speed:.2f}"
+        )
     print(
         f"[Policy eval] n_eval={args.n_eval} batch_envs={eval_num_envs} "
         f"episode_length={args.episode_length} v_drone={args.v_drone_test} "
-        f"v_prey={args.v_prey_test} random_init={args.random_init}"
+        f"v_prey={args.v_prey_test} random_init={args.random_init} "
+        f"deterministic={args.deterministic}"
     )
 
     results = []
@@ -348,6 +372,7 @@ def main(cfg):
             base_env=base_env,
             policy=policy,
             max_steps=int(args.episode_length),
+            deterministic=bool(args.deterministic),
         )
         for ep_info in wave_results:
             if eval_done >= int(args.n_eval):
@@ -375,6 +400,12 @@ def main(cfg):
             f"  Capture steps : mean={np.mean(cap_steps):.1f}, "
             f"std={np.std(cap_steps):.1f}, min={np.min(cap_steps)}, max={np.max(cap_steps)}"
         , flush=True)
+    print(
+        f"  TP pred err   : all={_mean(results, 'target_predicted_error'):.4f}, "
+        f"capture={_mean([r for r in results if r['success']], 'target_predicted_error'):.4f}, "
+        f"timeout={_mean([r for r in results if r['timeout']], 'target_predicted_error'):.4f}, "
+        f"goal={_mean([r for r in results if r['goal']], 'target_predicted_error'):.4f}"
+    , flush=True)
     print(
         f"  Timeout avg   : mindist={_mean([r for r in results if r['timeout']], 'min_target_dist_seen'):.3f}, "
         f"dmin={_mean([r for r in results if r['timeout']], 'd_i_min'):.3f}, "

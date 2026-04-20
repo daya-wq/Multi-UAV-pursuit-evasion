@@ -89,6 +89,7 @@ class MAPPOPolicy(object):
         self.act_name = ("agents", "action")
         self.prev_act_name = ("agents", "prev_action")
         self.raw_act_name = ("agents", "action_raw")
+        self.expert_act_name = ("agents", "expert_action")
         self.reward_name = ("agents", "reward")
         self._cached_prev_action = None
 
@@ -98,6 +99,32 @@ class MAPPOPolicy(object):
         self.TP_net = TP_net
         self.TP_optimizer = torch.optim.Adam(self.TP_net.parameters(), lr=0.0001)
         self.TP_criterion = nn.MSELoss()
+        expert_kl_cfg = self.cfg.get("warmstart", {}).get("expert_kl", None)
+        self.expert_kl_enabled = bool(expert_kl_cfg is not None and expert_kl_cfg.get("enabled", False))
+        self.expert_kl_coef: float = 0.0
+        self.expert_kl_loss_type: str = "nll"
+        self.expert_kl_max_loss: Optional[float] = None
+        self.expert_kl_fixed_std: float = 0.25
+        self.expert_kl_mse_boost_enabled: bool = False
+        self.expert_kl_mse_boost_threshold: float = 0.02
+        self.expert_kl_mse_boost_coef: float = 2.0
+        self.expert_kl_mse_boost_ema_beta: float = 0.95
+        self.expert_kl_mse_ema: Optional[float] = None
+        if self.expert_kl_enabled:
+            self.expert_kl_loss_type = str(expert_kl_cfg.get("loss_type", "nll"))
+            max_loss = expert_kl_cfg.get("max_loss", None)
+            self.expert_kl_max_loss = None if max_loss is None else float(max_loss)
+            self.expert_kl_fixed_std = float(expert_kl_cfg.get("fixed_std", self.expert_kl_fixed_std))
+            self.expert_kl_mse_boost_enabled = bool(expert_kl_cfg.get("mse_boost_enabled", False))
+            self.expert_kl_mse_boost_threshold = float(
+                expert_kl_cfg.get("mse_boost_threshold", self.expert_kl_mse_boost_threshold)
+            )
+            self.expert_kl_mse_boost_coef = float(
+                expert_kl_cfg.get("mse_boost_coef", self.expert_kl_mse_boost_coef)
+            )
+            self.expert_kl_mse_boost_ema_beta = float(
+                expert_kl_cfg.get("mse_boost_ema_beta", self.expert_kl_mse_boost_ema_beta)
+            )
 
         self.train_in_keys = list(
             set(
@@ -113,11 +140,19 @@ class MAPPOPolicy(object):
                     "state_value",
                 ]
                 + ["progress", ("collector", "traj_ids")]
+                + ([self.expert_act_name] if self.expert_kl_enabled else [])
             )
         )
 
         self.n_updates = 0
         self._tp_debug_emitted = False
+        self.actor_frozen = False
+        self.ppo_target_kl: Optional[float] = None
+        self.ppo_kl_coef: float = 0.0
+        self.ppo_kl_hard_stop: bool = False
+        self.anchor_actor_params: Optional[TensorDictParams] = None
+        self.anchor_loss_coef: float = 0.0
+        self.anchor_loss_type: str = "mse"
 
     @property
     def act_logps_name(self):
@@ -189,6 +224,20 @@ class MAPPOPolicy(object):
             self.actor_opt_scheduler: LR_SCHEDULER = actor_scheduler(
                 self.actor_opt, **actor_scheduler_kwargs
             )
+
+    def _reset_actor_optimizer(self):
+        cfg = self.cfg.actor
+        self.actor_opt = torch.optim.Adam(self.actor_params.parameters(), lr=cfg.lr)
+        actor_scheduler = cfg.get("lr_scheduler", None) if hasattr(cfg, "get") else getattr(cfg, "lr_scheduler", None)
+        if actor_scheduler is None:
+            if hasattr(self, "actor_opt_scheduler"):
+                delattr(self, "actor_opt_scheduler")
+            return
+        actor_scheduler = eval(actor_scheduler)
+        actor_scheduler_kwargs = cfg.get("lr_scheduler_kwargs", {}) if hasattr(cfg, "get") else getattr(cfg, "lr_scheduler_kwargs", {})
+        if actor_scheduler_kwargs is None:
+            actor_scheduler_kwargs = {}
+        self.actor_opt_scheduler = actor_scheduler(self.actor_opt, **actor_scheduler_kwargs)
 
     def make_critic(self):
         cfg = self.cfg.critic
@@ -295,6 +344,93 @@ class MAPPOPolicy(object):
     def reset_prev_action_cache(self):
         self._cached_prev_action = None
 
+    def set_actor_frozen(self, frozen: bool):
+        self.actor_frozen = bool(frozen)
+
+    def set_actor_lr(self, lr: float):
+        lr = float(lr)
+        for group in self.actor_opt.param_groups:
+            group["lr"] = lr
+
+    def set_critic_lr(self, lr: float):
+        lr = float(lr)
+        for group in self.critic_opt.param_groups:
+            group["lr"] = lr
+
+    def set_kl_reg(self, target_kl: Optional[float], coef: float = 0.0, hard_stop: bool = False):
+        self.ppo_target_kl = None if target_kl is None else float(target_kl)
+        self.ppo_kl_coef = float(coef)
+        self.ppo_kl_hard_stop = bool(hard_stop)
+
+    def capture_anchor_actor(self):
+        anchor_td = self.actor_params.to(self.device).to_tensordict().clone()
+        self.anchor_actor_params = TensorDictParams(anchor_td)
+
+    def clear_anchor_actor(self):
+        self.anchor_actor_params = None
+
+    def set_anchor_loss(self, coef: float = 0.0, loss_type: str = "mse"):
+        self.anchor_loss_coef = float(coef)
+        self.anchor_loss_type = str(loss_type)
+
+    def set_expert_kl_loss(
+        self,
+        coef: float = 0.0,
+        loss_type: Optional[str] = None,
+        max_loss: Optional[float] = None,
+    ):
+        self.expert_kl_coef = float(coef)
+        if loss_type is not None:
+            self.expert_kl_loss_type = str(loss_type)
+        if max_loss is not None:
+            self.expert_kl_max_loss = float(max_loss)
+
+    def _run_actor(
+        self,
+        actor_input: TensorDict,
+        actor_params,
+        deterministic: bool = False,
+        eval_action: bool = False,
+    ):
+        randomness = "different" if (not deterministic and not eval_action) else "error"
+        if hasattr(self, "minibatch_seq_len"):
+            agent_dim = len(actor_input.batch_size) - 1
+            if self.cfg.share_actor:
+                return vmap(
+                    self.actor,
+                    in_dims=(agent_dim, None),
+                    out_dims=agent_dim,
+                    randomness=randomness,
+                )(
+                    actor_input, actor_params, deterministic=deterministic, eval_action=eval_action
+                )
+            return vmap(
+                self.actor,
+                in_dims=(agent_dim, 0),
+                out_dims=agent_dim,
+                randomness=randomness,
+            )(
+                actor_input, actor_params, deterministic=deterministic, eval_action=eval_action
+            )
+        if self.cfg.share_actor:
+            return self.actor(
+                actor_input,
+                actor_params,
+                deterministic=deterministic,
+                eval_action=eval_action,
+            )
+        return vmap(
+            self.actor,
+            in_dims=(1, 0),
+            out_dims=1,
+            randomness=randomness,
+        )(
+            actor_input,
+            actor_params,
+            deterministic=deterministic,
+            eval_action=eval_action,
+        )
+
     def value_op(self, tensordict: TensorDict) -> TensorDict:
         critic_input = tensordict.select(*self.critic_in_keys, strict=False)
         if "is_init" in critic_input.keys():
@@ -316,21 +452,12 @@ class MAPPOPolicy(object):
             actor_input["is_init"], (*actor_input.batch_size, self.agent_spec.n, 1)
         )
         actor_input.batch_size = [*actor_input.batch_size, self.agent_spec.n] # [env_num, drone_num]
-        if self.cfg.share_actor:
-            if self.cfg.actor.get("rnn", None):
-                agent_dim = len(actor_input.batch_size) - 1
-                actor_output = vmap(
-                    self.actor,
-                    in_dims=(agent_dim, None),
-                    out_dims=agent_dim,
-                    randomness="different",
-                )(actor_input, self.actor_params, deterministic=deterministic)
-            else:
-                actor_output = self.actor(actor_input, self.actor_params, deterministic=deterministic)
-        else:
-            actor_output = vmap(self.actor, in_dims=(1, 0), out_dims=1, randomness="different")(
-                actor_input, self.actor_params, deterministic=deterministic
-            )
+        actor_output = self._run_actor(
+            actor_input,
+            self.actor_params,
+            deterministic=deterministic,
+            eval_action=False,
+        )
 
         self._cache_prev_action(actor_output.get(self.act_name, None))
         tensordict.update(actor_output)
@@ -357,6 +484,21 @@ class MAPPOPolicy(object):
         }
 
     def update_actor(self, batch: TensorDict) -> Dict[str, Any]:
+        if self.actor_frozen:
+            return {
+                "policy_loss": 0.0,
+                "actor_grad_norm": 0.0,
+                "entropy": float(self._get_actor_entropy_bonus().item()) if self._get_actor_entropy_bonus() is not None else 0.0,
+                "ESS": 1.0,
+                "approx_kl": 0.0,
+                "kl_penalty": 0.0,
+                "anchor_loss": 0.0,
+                "expert_kl_loss": 0.0,
+                "expert_action_mse": 0.0,
+                "expert_kl_effective_coef": float(self.expert_kl_coef),
+                "expert_action_mse_ema": float(self.expert_kl_mse_ema or 0.0),
+                "actor_update_skipped": 1.0,
+            }
         advantages = batch["advantages"]
         actor_input = batch.select(*self.actor_in_keys, strict=False).clone()
         if self.raw_act_name in batch.keys(True):
@@ -370,23 +512,12 @@ class MAPPOPolicy(object):
         actor_input.batch_size = [*actor_input.batch_size, self.agent_spec.n]
 
         log_probs_old = batch[self.act_logps_name]
-        if hasattr(self, "minibatch_seq_len"): # [N, T, A, *]
-            agent_dim = len(actor_input.batch_size) - 1
-            if self.cfg.share_actor:
-                actor_output = vmap(self.actor, in_dims=(agent_dim, None), out_dims=agent_dim)(
-                    actor_input, self.actor_params, eval_action=True
-                )
-            else:
-                actor_output = vmap(self.actor, in_dims=(agent_dim, 0), out_dims=agent_dim)(
-                    actor_input, self.actor_params, eval_action=True
-                )
-        else: # [N, A, *]
-            if self.cfg.share_actor:
-                actor_output = self.actor(actor_input, self.actor_params, eval_action=True)
-            else:
-                actor_output = vmap(self.actor, in_dims=(1, 0), out_dims=1)(
-                    actor_input, self.actor_params, eval_action=True
-                )
+        actor_output = self._run_actor(
+            actor_input,
+            self.actor_params,
+            deterministic=False,
+            eval_action=True,
+        )
 
         log_probs_new = actor_output[self.act_logps_name]
 
@@ -397,13 +528,119 @@ class MAPPOPolicy(object):
             * advantages
         )
         policy_loss = - torch.mean(torch.min(surr1, surr2) * self.act_dim)
+        approx_kl = torch.mean(log_probs_old - log_probs_new)
+        kl_penalty = torch.zeros((), device=policy_loss.device)
+        if self.ppo_target_kl is not None and self.ppo_kl_coef > 0.0:
+            kl_penalty = torch.relu(approx_kl - float(self.ppo_target_kl))
         entropy_bonus = self._get_actor_entropy_bonus()
         if entropy_bonus is None:
             entropy_bonus = -torch.mean(-log_probs_new.detach())
         entropy_loss = -entropy_bonus
+        anchor_loss = torch.zeros((), device=policy_loss.device)
+        if self.anchor_actor_params is not None and self.anchor_loss_coef > 0.0:
+            current_pred = self._run_actor(
+                actor_input,
+                self.actor_params,
+                deterministic=True,
+                eval_action=False,
+            )[self.act_name]
+            with torch.no_grad():
+                anchor_pred = self._run_actor(
+                    actor_input,
+                    self.anchor_actor_params,
+                    deterministic=True,
+                    eval_action=False,
+                )[self.act_name]
+            if self.anchor_loss_type == "l1":
+                anchor_loss = F.l1_loss(current_pred, anchor_pred)
+            else:
+                anchor_loss = F.mse_loss(current_pred, anchor_pred)
+
+        expert_kl_loss = torch.zeros((), device=policy_loss.device)
+        expert_action_mse = torch.zeros((), device=policy_loss.device)
+        expert_kl_effective_coef = float(self.expert_kl_coef)
+        if self.expert_kl_enabled and self.expert_kl_coef > 0.0 and self.expert_act_name in batch.keys(True):
+            expert_action = batch[self.expert_act_name].to(device=policy_loss.device, dtype=log_probs_new.dtype)
+            expert_loss_type = self.expert_kl_loss_type.lower()
+            if expert_loss_type in {"mse", "fixed_std_nll", "fixed_std_kl", "mse_fixed_std"}:
+                current_pred = self._run_actor(
+                    actor_input,
+                    self.actor_params,
+                    deterministic=True,
+                    eval_action=False,
+                )[self.act_name]
+                sq_error = (current_pred - expert_action).pow(2)
+                expert_action_mse_loss = sq_error.mean()
+                if expert_loss_type == "mse":
+                    expert_kl_loss = expert_action_mse_loss
+                else:
+                    # Use a fixed Gaussian std for the expert anchor. This keeps
+                    # the expert gradient alive even when the actor's own std is
+                    # intentionally very small for low-exploration rollouts.
+                    fixed_var = max(self.expert_kl_fixed_std, 1e-6) ** 2
+                    expert_kl_loss = 0.5 * expert_action_mse_loss / fixed_var
+                expert_action_mse = expert_action_mse_loss.detach()
+                mse_value = float(expert_action_mse.item())
+                if self.expert_kl_mse_ema is None:
+                    self.expert_kl_mse_ema = mse_value
+                else:
+                    beta = min(max(float(self.expert_kl_mse_boost_ema_beta), 0.0), 0.9999)
+                    self.expert_kl_mse_ema = beta * self.expert_kl_mse_ema + (1.0 - beta) * mse_value
+                if (
+                    self.expert_kl_mse_boost_enabled
+                    and self.expert_kl_mse_ema > self.expert_kl_mse_boost_threshold
+                ):
+                    expert_kl_effective_coef = max(
+                        expert_kl_effective_coef,
+                        float(self.expert_kl_mse_boost_coef),
+                    )
+            else:
+                expert_actor_input = actor_input.clone()
+                expert_actor_input[self.act_name] = expert_action
+                expert_output = self._run_actor(
+                    expert_actor_input,
+                    self.actor_params,
+                    deterministic=False,
+                    eval_action=True,
+                )
+                expert_log_probs = expert_output[self.act_logps_name]
+                expert_kl_loss = -expert_log_probs.mean()
+                if self.expert_kl_max_loss is not None:
+                    expert_kl_loss = torch.clamp(expert_kl_loss, max=float(self.expert_kl_max_loss))
+                with torch.no_grad():
+                    current_pred = self._run_actor(
+                        actor_input,
+                        self.actor_params,
+                        deterministic=True,
+                        eval_action=False,
+                    )[self.act_name]
+                    expert_action_mse = F.mse_loss(current_pred, expert_action)
+
+        total_actor_loss = (
+            policy_loss
+            + entropy_loss * self.entropy_coef
+            + kl_penalty * self.ppo_kl_coef
+            + anchor_loss * self.anchor_loss_coef
+            + expert_kl_loss * expert_kl_effective_coef
+        )
+        if self.ppo_target_kl is not None and self.ppo_kl_hard_stop and float(approx_kl.item()) > float(self.ppo_target_kl):
+            return {
+                "policy_loss": policy_loss.item(),
+                "actor_grad_norm": 0.0,
+                "entropy": entropy_bonus.item(),
+                "ESS": ((2 * ratio.logsumexp(0) - (2 * ratio).logsumexp(0)).exp().mean() / ratio.shape[0]).item(),
+                "approx_kl": approx_kl.item(),
+                "kl_penalty": kl_penalty.item(),
+                "anchor_loss": anchor_loss.item(),
+                "expert_kl_loss": expert_kl_loss.item(),
+                "expert_action_mse": expert_action_mse.item(),
+                "expert_kl_effective_coef": float(expert_kl_effective_coef),
+                "expert_action_mse_ema": float(self.expert_kl_mse_ema or 0.0),
+                "actor_update_skipped": 1.0,
+            }
 
         self.actor_opt.zero_grad()
-        (policy_loss + entropy_loss * self.entropy_coef).backward()
+        total_actor_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.actor_opt.param_groups[0]["params"], self.cfg.max_grad_norm
         )
@@ -415,7 +652,15 @@ class MAPPOPolicy(object):
             "policy_loss": policy_loss.item(),
             "actor_grad_norm": grad_norm.item(),
             "entropy": entropy_bonus.item(),
-            "ESS": ess.item()
+            "ESS": ess.item(),
+            "approx_kl": approx_kl.item(),
+            "kl_penalty": kl_penalty.item(),
+            "anchor_loss": anchor_loss.item(),
+            "expert_kl_loss": expert_kl_loss.item(),
+            "expert_action_mse": expert_action_mse.item(),
+            "expert_kl_effective_coef": float(expert_kl_effective_coef),
+            "expert_action_mse_ema": float(self.expert_kl_mse_ema or 0.0),
+            "actor_update_skipped": 0.0,
         }
 
     def update_actor_bc(
@@ -430,6 +675,7 @@ class MAPPOPolicy(object):
         aux_forward_dir_coef: float = 0.0,
         aux_assignment_coef: float = 0.0,
         aux_trap_coef: float = 0.0,
+        action_dim_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         actor_input = batch.select(*self.actor_in_keys, strict=False).clone()
         target_action = batch.get(self.raw_act_name, batch[self.act_name])
@@ -495,8 +741,16 @@ class MAPPOPolicy(object):
                 w = w.unsqueeze(-1)
             return (value * w).sum() / w.expand_as(value).sum().clamp_min(1e-8)
 
-        sq_err = (pred_action - target_action).pow(2)
-        action_mse = sq_err.mean()
+        sq_err_raw = (pred_action - target_action).pow(2)
+        # Per-dimension action weighting (e.g. upweight yaw/thrust)
+        if action_dim_weights is not None:
+            dim_w = action_dim_weights.to(device=sq_err_raw.device, dtype=sq_err_raw.dtype)
+            # Normalize so mean weight = 1 (preserves loss scale)
+            dim_w = dim_w / dim_w.mean().clamp_min(1e-8)
+            sq_err = sq_err_raw * dim_w
+        else:
+            sq_err = sq_err_raw
+        action_mse = sq_err_raw.mean()
         if sample_weight is not None:
             weight = sample_weight.to(device=pred_action.device, dtype=pred_action.dtype)
             weighted_action_mse = weighted_mean(sq_err, weight)
@@ -585,7 +839,12 @@ class MAPPOPolicy(object):
                 bc_loss = bc_loss - float(entropy_bonus_coef) * entropy
                 entropy_value = float(entropy.item())
             else:
-                entropy_value = float(-action_log_probs.mean().item())
+                # For tanh actor: use -log_prob as entropy proxy so that
+                # entropy_bonus_coef can keep log_std from collapsing.
+                neg_logp_entropy = -action_log_probs.mean()
+                if float(entropy_bonus_coef) != 0.0:
+                    bc_loss = bc_loss - float(entropy_bonus_coef) * neg_logp_entropy
+                entropy_value = float(neg_logp_entropy.item())
 
         log_std_values = []
         for name, param in self.actor_params.named_parameters():
@@ -608,7 +867,14 @@ class MAPPOPolicy(object):
         )
         self.actor_opt.step()
 
-        return {
+        # Per-dimension MSE diagnostics (unweighted, for monitoring)
+        per_dim_mse = {}
+        if sq_err_raw.shape[-1] >= 4:
+            dim_names = ["roll", "pitch", "yaw", "thrust"]
+            for di, dn in enumerate(dim_names):
+                per_dim_mse[f"bc_mse_{dn}"] = float(sq_err_raw[..., di].mean().item())
+
+        result = {
             "bc_loss": float(bc_loss.item()),
             "bc_action_mse_loss": float(weighted_action_mse.item() * float(action_mse_coef)),
             "bc_log_prob_loss": float(log_prob_loss_value * float(log_prob_coef)),
@@ -632,6 +898,8 @@ class MAPPOPolicy(object):
             "bc_log_std_min": float(log_std_min),
             "bc_log_std_max": float(log_std_max),
         }
+        result.update(per_dim_mse)
+        return result
 
     def update_critic(self, batch: TensorDict) -> Dict[str, Any]:
         critic_input = batch.select(*self.critic_in_keys)
@@ -898,7 +1166,7 @@ class MAPPOPolicy(object):
         # step LR schedulers if configured
         if hasattr(self, "critic_opt_scheduler"):
             self.critic_opt_scheduler.step()
-        if hasattr(self, "actor_opt_scheduler"):
+        if hasattr(self, "actor_opt_scheduler") and not self.actor_frozen:
             self.actor_opt_scheduler.step()
         return {f"{self.agent_spec.name}/{k}": v for k, v in train_info.items()}
 
@@ -921,11 +1189,27 @@ class MAPPOPolicy(object):
             "actor_rnn_hidden_size": int(self.cfg.actor.rnn.kwargs.hidden_size)
             if self.cfg.actor.get("rnn", None) is not None
             else 0,
+            # Optimizer states for seamless checkpoint resume
+            "actor_opt": self.actor_opt.state_dict(),
+            "critic_opt": self.critic_opt.state_dict(),
         }
         return state_dict
 
     def set_entropy_coef(self, value: float):
         self.entropy_coef = float(value)
+
+    def set_actor_log_std(self, value: float):
+        try:
+            log_std = self.actor_params["module"]["act_dist"]["log_std"]
+        except KeyError:
+            return None
+        value = float(value)
+        log_std_min = float(self.cfg.actor.get("log_std_min", -5.0))
+        log_std_max = float(self.cfg.actor.get("log_std_max", 1.0))
+        value = max(min(value, log_std_max), log_std_min)
+        with torch.no_grad():
+            log_std.fill_(value)
+        return value
     
     def load_state_dict(self, state_dict):
         self.TP_net.load_state_dict(state_dict["TP"])
@@ -933,9 +1217,35 @@ class MAPPOPolicy(object):
         current_actor_params = self.actor_params.to_tensordict()
         current_actor_params.update(loaded_actor_params)
         self.actor_params = TensorDictParams(current_actor_params)
-        self.actor_opt = torch.optim.Adam(self.actor_params.parameters(), lr=self.cfg.actor.lr)
+        self._reset_actor_optimizer()
+        # Restore optimizer states if available (backward compatible with old checkpoints)
+        if "actor_opt" in state_dict:
+            try:
+                self.actor_opt.load_state_dict(state_dict["actor_opt"])
+                logging.info("Restored actor optimizer state from checkpoint.")
+            except Exception as e:
+                logging.warning("Failed to restore actor optimizer state: %s. Using fresh optimizer.", e)
+        else:
+            logging.info("No actor optimizer state in checkpoint. Using fresh optimizer.")
         self.critic.load_state_dict(state_dict["critic"])
+        if "critic_opt" in state_dict:
+            try:
+                self.critic_opt.load_state_dict(state_dict["critic_opt"])
+                logging.info("Restored critic optimizer state from checkpoint.")
+            except Exception as e:
+                logging.warning("Failed to restore critic optimizer state: %s. Using fresh optimizer.", e)
+        else:
+            logging.info("No critic optimizer state in checkpoint. Using fresh optimizer.")
         self.value_normalizer.load_state_dict(state_dict["value_normalizer"])
+        self.reset_prev_action_cache()
+
+    def load_actor_tp_state_dict(self, state_dict):
+        self.TP_net.load_state_dict(state_dict["TP"])
+        loaded_actor_params = state_dict["actor_params"].to(self.device).to_tensordict()
+        current_actor_params = self.actor_params.to_tensordict()
+        current_actor_params.update(loaded_actor_params)
+        self.actor_params = TensorDictParams(current_actor_params)
+        self._reset_actor_optimizer()
         self.reset_prev_action_cache()
 
 def make_dataset_naive(
@@ -1148,6 +1458,9 @@ class Actor(nn.Module):
         deterministic=False,
         eval_action=False
     ):
+        if eval_action and action is None and prev_action is not None and self.prev_action_conditioner is None:
+            action = prev_action
+            prev_action = None
         actor_features = self.encoder(obs)
         if self.rnn is not None:
             actor_features, rnn_state = self.rnn(actor_features, rnn_state, is_init)    

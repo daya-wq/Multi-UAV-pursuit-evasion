@@ -368,7 +368,14 @@ class CoopEntityAttentionEncoder(nn.Module):
             batch_first=True,
             activation="gelu",
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Disable nested-tensor fast path: it is incompatible with the
+        # functorch/vmap actor path used by our shared recurrent actor under
+        # the Isaac Sim bundled torch runtime.
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
         self.token_norm = nn.LayerNorm(embed_dim) if layer_norm else None
 
     @staticmethod

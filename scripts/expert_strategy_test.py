@@ -10,8 +10,10 @@ expert_strategy_test.py
 合成速度超过 v_max=1.5 m/s 时在速度层面截断。
 
 目标预测模式（--pred_mode 参数）：
-  "noise"   : 直接读取目标下一帧位置，叠加上限 0.5 的均匀球面噪声
-  "tp_net"  : 载入 tp_only_1690959872.pt，用 TP_net 预测下一时刻目标位置
+  "noise"       : 直接读取目标下一帧位置，叠加上限 0.5 的均匀球面噪声
+  "tp_net"      : 载入 tp_only_1690959872.pt，用 TP_net 预测下一时刻目标位置
+  "oracle_pos"  : 直接使用目标当前真实位置
+  "oracle_next" : 直接使用目标下一时刻真实位置
 
 测试配置与现有 HideAndSeek 环境完全一致（见 cfg/task/HideAndSeek.yaml）。
 运行 50 轮，统计：
@@ -83,6 +85,27 @@ class EnvCfg:
     max_thrust_ratio: float = 0.9
     hover_thrust_ratio: float = 0.52
     max_body_rate_rad_s: float = math.radians(180.0 * 0.8)
+    low_altitude_guard_z: float = 0.40
+    strategy_variant: str = "baseline"
+    forward_dir_mode: str = "default"
+    enable_goal_mode: bool = True
+    enable_close_mode: bool = True
+    enable_rush_mode: bool = True
+    expert2_rear_back: float = 0.30
+    expert2_side_width: float = 0.40
+    expert2_front_layout: str = "symmetric"
+    expert2_front_lead_forward: float = 0.20
+    expert2_front_lead_side: float = 0.40
+    expert2_chaser_close_back: float = 0.10
+    expert2_front_close_forward: float = 0.03
+    expert2_front_close_side: float = 0.24
+    expert2_chaser_inward_gain: float = 0.16
+    expert2_front_inward_gain: float = 0.05
+    expert2_chaser_close_target_threshold: float = 0.95
+    expert2_front_close_target_threshold: float = 0.75
+    expert2_close_safe_dist: float = 0.36
+    expert2_close_repulse_gain: float = 0.65
+    expert2_close_repulse_closing_boost: float = 0.50
 
     # goal / defense zone
     goal_region_center = torch.tensor([2.0, 0.0, 2.5])
@@ -102,6 +125,8 @@ class EnvCfg:
     history_step: int = 10
     future_predcition_step: int = 5
     window_step: int = 1
+    expert_intercept_pred_step: int = 5
+    expert_intercept_use_direct_pred: bool = False
 
     # initial positions (use_eval=1 layout, matches _reset_idx)
     goal_z: float = 2.5
@@ -310,7 +335,14 @@ class TPNetPredictor:
             out = self.net(history_tensor)  # [1, future_step*3], tanh output
         out = out.reshape(self.cfg.future_predcition_step, 3)
         # denormalize (mirrors hideandseek.py lines 910-913)
-        pred = out[0].clone()
+        pred_idx = max(
+            0,
+            min(
+                int(getattr(self.cfg, "expert_intercept_pred_step", 5)) - 1,
+                int(self.cfg.future_predcition_step) - 1,
+            ),
+        )
+        pred = out[pred_idx].clone()
         pred[:2] = pred[:2] * self.cfg.arena_size
         pred[2]  = (pred[2] + 1.0) / 2.0 * self.cfg.max_height
         return pred
@@ -357,6 +389,10 @@ class ExpertPolicy:
             return self.tp_predictor.predict_next_pos(
                 step, target_pos, target_vel, drone_pos
             )
+        elif self.pred_mode == "oracle_pos":
+            return target_pos.squeeze(0).clone()
+        elif self.pred_mode == "oracle_next":
+            return target_next_pos.squeeze(0).clone()
         else:  # "noise" mode
             noise_mag = torch.empty(1).uniform_(0.0, 0.5).item()
             direction = torch.randn(3, device=target_pos.device, dtype=target_pos.dtype)
@@ -393,9 +429,11 @@ class ExpertPolicy:
         goal_vec = goal_pos - target_pos
         goal_dist = goal_vec.norm()
         goal_dir = safe_normalize(goal_vec.unsqueeze(0)).squeeze(0)
-
         lookahead_time = 0.18 if goal_dist > 1.4 else 0.10
-        intercept_seed = target_pos_pred + target_vel * lookahead_time
+        if bool(getattr(self.cfg, "expert_intercept_use_direct_pred", False)):
+            intercept_seed = target_pos_pred
+        else:
+            intercept_seed = target_pos_pred + target_vel * lookahead_time
 
         motion_hint = target_vel
         if motion_hint.norm() < 1e-4:
@@ -403,20 +441,53 @@ class ExpertPolicy:
         if motion_hint.norm() < 1e-4:
             motion_hint = goal_dir
         motion_dir = safe_normalize(motion_hint.unsqueeze(0)).squeeze(0)
-        forward_dir = safe_normalize((0.7 * goal_dir + 0.3 * motion_dir).unsqueeze(0)).squeeze(0)
+
+        trap_mode = bool(goal_dist < 1.55)
+        goal_emergency = bool(goal_dist < 1.10)
+        if self.cfg.strategy_variant == "expert2" and not bool(self.cfg.enable_goal_mode):
+            goal_emergency = False
+
+        if self.cfg.strategy_variant == "expert2" and not bool(self.cfg.enable_goal_mode):
+            forward_dir = motion_dir
+        elif self.cfg.forward_dir_mode == "motion_only":
+            forward_dir = motion_dir
+        else:
+            if self.cfg.forward_dir_mode == "motion_biased":
+                if self.cfg.strategy_variant == "expert2":
+                    goal_weight = 0.80 if goal_emergency else 0.45
+                else:
+                    goal_weight = 0.80 if goal_emergency else (0.60 if trap_mode else 0.45)
+            else:
+                if self.cfg.strategy_variant == "expert2":
+                    goal_weight = 0.92 if goal_emergency else 0.70
+                else:
+                    goal_weight = 0.92 if goal_emergency else (0.80 if trap_mode else 0.70)
+            forward_dir = safe_normalize(
+                (goal_weight * goal_dir + (1 - goal_weight) * motion_dir).unsqueeze(0)
+            ).squeeze(0)
 
         up = torch.tensor([0.0, 0.0, 1.0], device=target_pos.device, dtype=target_pos.dtype)
         lateral = torch.linalg.cross(up, forward_dir)
         if lateral.norm() < 1e-5:
             lateral = torch.tensor([1.0, 0.0, 0.0], device=target_pos.device, dtype=target_pos.dtype)
         lateral = safe_normalize(lateral.unsqueeze(0)).squeeze(0)
+        if self.cfg.strategy_variant == "expert2":
+            rear_offset = 0.0 if goal_emergency else -float(self.cfg.expert2_rear_back)
+            rear = intercept_seed + forward_dir * rear_offset
+            if self.cfg.expert2_front_layout == "staggered":
+                left = intercept_seed.clone()
+                right = (
+                    intercept_seed
+                    + forward_dir * float(self.cfg.expert2_front_lead_forward)
+                    + lateral * float(self.cfg.expert2_front_lead_side)
+                )
+            else:
+                left = intercept_seed + lateral * float(self.cfg.expert2_side_width)
+                right = intercept_seed - lateral * float(self.cfg.expert2_side_width)
+            anchors = torch.stack([rear, left, right], dim=0)
+            return anchors, forward_dir, False
 
-        trap_mode = bool(goal_dist < 1.55)
-        goal_emergency = bool(goal_dist < 1.10)
         front_cap = max(0.45, float(goal_dist.item()) - self.cfg.goal_region_radius - 0.12)
-        # Only keep one true blocker in front; the other two should squeeze from
-        # the sides or slightly behind. The previous "all three ahead" wall was
-        # stable but often failed to reduce min target distance below catch_radius.
         base_front = min(front_cap, 1.00 if not trap_mode else 0.62)
         side_front = -0.10 if not trap_mode else min(front_cap, 0.32 if goal_emergency else 0.18)
         side_width = 0.64 if not trap_mode else (0.28 if goal_emergency else 0.34)
@@ -506,8 +577,13 @@ class ExpertPolicy:
 
         vel_error = desired_vel - current_vel
         acc_cmd = 3.2 * vel_error
-        acc_cmd[:2] = clip_vector_norm(acc_cmd[:2].unsqueeze(0), 4.2).squeeze(0)
+        # Clamp z first, then couple xy limit to max tilt angle
         acc_cmd[2] = acc_cmd[2].clamp(-3.5, 3.5)
+        # Coupled xy limit: ||a_xy|| ≤ (g + a_z) * tan(θ_max)
+        # Ensures thrust direction never exceeds θ_max tilt
+        max_tilt_tan = math.tan(math.radians(25))  # θ_max = 25°
+        a_xy_max = max(0.1, (gravity + acc_cmd[2].item()) * max_tilt_tan)
+        acc_cmd[:2] = clip_vector_norm(acc_cmd[:2].unsqueeze(0), a_xy_max).squeeze(0)
 
         e3 = torch.tensor([0.0, 0.0, 1.0], device=desired_vel.device, dtype=desired_vel.dtype)
         thrust_world = acc_cmd + gravity * e3
@@ -547,10 +623,10 @@ class ExpertPolicy:
             + torch.linalg.cross(y_cur, y_des)
             + torch.linalg.cross(z_cur, z_des)
         )
-        omega_world = 2.7 * e_rot
+        omega_world = 2.0 * e_rot
         omega_body = quat_rotate_inverse(current_quat.unsqueeze(0), omega_world.unsqueeze(0)).squeeze(0)
         omega_body = clip_vector_norm(
-            omega_body.unsqueeze(0), 0.85 * max_body_rate_rad_s
+            omega_body.unsqueeze(0), 0.65 * max_body_rate_rad_s
         ).squeeze(0)
         if torch.isnan(omega_body).any():
             omega_body = torch.zeros_like(desired_vel)
@@ -559,14 +635,27 @@ class ExpertPolicy:
         return t, omega_body, desired_vel
 
     @staticmethod
-    def t_omega_to_pidrate_raw(
+    def t_omega_to_pidrate_action(
         t: torch.Tensor,
         omega: torch.Tensor,
         max_body_rate_rad_s: float,
     ) -> torch.Tensor:
         rate_norm = (omega / max(max_body_rate_rad_s, 1e-6)).clamp(-0.999, 0.999)
         thrust_norm = (2.0 * t - 1.0).clamp(-0.999, 0.999).unsqueeze(-1)
-        return safe_atanh(torch.cat([rate_norm, thrust_norm], dim=-1))
+        return torch.cat([rate_norm, thrust_norm], dim=-1)
+
+    @staticmethod
+    def t_omega_to_pidrate_raw(
+        t: torch.Tensor,
+        omega: torch.Tensor,
+        max_body_rate_rad_s: float,
+    ) -> torch.Tensor:
+        action = ExpertPolicy.t_omega_to_pidrate_action(
+            t,
+            omega,
+            max_body_rate_rad_s=max_body_rate_rad_s,
+        )
+        return safe_atanh(action)
 
     # ── 核心推断接口 ───────────────────────────────────────────
     def get_actions(self, step: int,
@@ -574,8 +663,9 @@ class ExpertPolicy:
                     drone_vel: torch.Tensor,     # [n,3]
                     target_pos: torch.Tensor,    # [1,3]
                     target_vel: torch.Tensor,    # [1,3]
-                    target_next_pos: torch.Tensor,  # [1,3]  真实下一帧位置（用于noise模式）
+                    target_next_pos: torch.Tensor,  # [1,3]  真实下一帧位置（用于noise/oracle_next）
                     drone_quat: Optional[torch.Tensor] = None,  # [n,4]
+                    return_debug: bool = False,
                     ) -> tuple:
         """
         返回:
@@ -600,47 +690,93 @@ class ExpertPolicy:
         )
         assignment = self._assign_anchors(drone_pos, anchors)
         target_vel_ff = target_vel.squeeze(0)
-        min_target_dist = torch.norm(drone_pos - target_pos_flat, dim=-1).min().item()
+        dist_to_target = torch.norm(drone_pos - target_pos_flat, dim=-1)  # [n]
+        min_target_dist = dist_to_target.min().item()
         goal_dist = torch.norm(goal_pos - target_pos_flat).item()
+        # ── Rush Mode: designate exactly ONE drone to charge at target ──
+        rush_mode = bool(self.cfg.enable_rush_mode) and min_target_dist < self.cfg.catch_radius * 1.8
+        rush_idx = int(dist_to_target.argmin().item()) if rush_mode else -1
 
         t_list     = []
         omega_list = []
         vel_cmd    = []
 
         for i in range(n):
+            # All drones use formation logic; rush drone gets boosted close_mode params
             anchor_idx = int(assignment[i].item())
             waypoint = anchors[anchor_idx]
             to_wp = waypoint - drone_pos[i]
             dist_wp = to_wp.norm()
 
+            is_expert2 = self.cfg.strategy_variant == "expert2"
+            is_chaser = is_expert2 and anchor_idx == 0
+            is_front_interceptor = is_expert2 and anchor_idx != 0
+
             feedforward = target_vel_ff.clone()
-            if anchor_idx == 0:
-                feedforward = feedforward + 0.22 * forward_dir
+            if is_expert2:
+                if is_chaser:
+                    feedforward = feedforward - 0.08 * forward_dir
+                    kp = 1.70
+                else:
+                    feedforward = feedforward + 0.10 * forward_dir
+                    kp = 1.80
             else:
-                feedforward = feedforward - 0.05 * forward_dir
-            kp = 1.90 if anchor_idx == 0 else 1.65
-            if trap_mode:
-                kp += 0.20
+                if anchor_idx == 0:
+                    feedforward = feedforward + 0.22 * forward_dir
+                else:
+                    feedforward = feedforward - 0.05 * forward_dir
+                kp = 1.90 if anchor_idx == 0 else 1.65
+                if trap_mode:
+                    kp += 0.20
             kd = 0.26
             v_des = kp * to_wp + 0.85 * feedforward - kd * drone_vel[i]
 
             # Keep altitude close to the target plane to avoid aggressive dives.
             # If we are close to the goal and missed the first interception window,
             # rebuild the frontal barrier instead of tail-chasing forever.
-            close_mode = dist_wp < 0.45 or min_target_dist < 0.95
+            if bool(self.cfg.enable_close_mode):
+                if is_expert2:
+                    target_close_threshold = (
+                        self.cfg.expert2_chaser_close_target_threshold
+                        if is_chaser
+                        else self.cfg.expert2_front_close_target_threshold
+                    )
+                    close_mode = (dist_wp < 0.45) or (dist_to_target[i].item() < target_close_threshold)
+                else:
+                    close_mode = (dist_wp < 0.45) or (min_target_dist < 0.95)
+            else:
+                close_mode = False
             desired_height = float(target_pos_pred[2].item()) + (0.10 if close_mode else 0.05)
             desired_height = max(1.2, min(self.cfg.max_height - 0.4, desired_height))
             v_des[2] = 0.90 * (desired_height - drone_pos[i, 2]) - 0.45 * drone_vel[i, 2]
 
-            if goal_dist < 1.4 and anchor_idx == 0 and dist_wp > 0.45:
+            if (not is_expert2) and goal_dist < 1.4 and anchor_idx == 0 and dist_wp > 0.45:
                 frontal_wp = target_pos_pred + 0.95 * forward_dir
-                v_des = 1.60 * (frontal_wp - drone_pos[i]) + 0.70 * feedforward - 0.35 * drone_vel[i]
+                v_des = 1.60 * (frontal_wp - drone_pos[i]) + 0.68 * feedforward - 0.35 * drone_vel[i]
                 v_des[2] = 0.95 * (desired_height - drone_pos[i, 2]) - 0.45 * drone_vel[i, 2]
 
             # Once a drone is close enough, collapse from its assigned side
             # instead of orbiting around the target forever.
             if close_mode:
-                if anchor_idx == 0:
+                if rush_mode and i == rush_idx:
+                    close_wp = target_pos_pred.clone()
+                    inward_gain = 0.35
+                elif is_expert2 and is_chaser:
+                    close_wp = target_pos_pred - float(self.cfg.expert2_chaser_close_back) * forward_dir
+                    inward_gain = float(self.cfg.expert2_chaser_inward_gain)
+                elif is_expert2 and is_front_interceptor:
+                    side_axis = project_to_plane(waypoint - target_pos_flat, forward_dir)
+                    if side_axis.norm() > 1e-5:
+                        side_axis = safe_normalize(side_axis.unsqueeze(0)).squeeze(0)
+                    else:
+                        side_axis = torch.zeros_like(forward_dir)
+                    close_wp = (
+                        target_pos_pred
+                        + float(self.cfg.expert2_front_close_forward) * forward_dir
+                        + side_axis * float(self.cfg.expert2_front_close_side)
+                    )
+                    inward_gain = float(self.cfg.expert2_front_inward_gain)
+                elif anchor_idx == 0:
                     close_wp = target_pos_pred + 0.03 * forward_dir
                     inward_gain = 0.18
                 else:
@@ -660,11 +796,45 @@ class ExpertPolicy:
                 )
                 v_des[2] = 0.90 * (float(target_pos_pred[2].item()) - drone_pos[i, 2]) - 0.55 * drone_vel[i, 2]
 
-            speed_cap = self.cfg.v_drone if (not close_mode or anchor_idx == 0) else 0.96 * self.cfg.v_drone
-            v_des = clip_vector_norm(v_des.unsqueeze(0), speed_cap).squeeze(0)
+            v_des = clip_vector_norm(v_des.unsqueeze(0), self.cfg.v_drone).squeeze(0)
+
+            # ── Drone-Drone collision avoidance (repulsive velocity correction) ──
+            safe_dist = 4.0 * self.cfg.collision_radius  # 0.28m
+            repulse_gain = 0.5
+            if is_expert2 and close_mode:
+                safe_dist = float(self.cfg.expert2_close_safe_dist)
+                repulse_gain = float(self.cfg.expert2_close_repulse_gain)
+            for j in range(n):
+                if j == i:
+                    continue
+                sep = drone_pos[i] - drone_pos[j]  # vector from j to i
+                d = sep.norm().item()
+                if d < safe_dist:
+                    repulse_dir = safe_normalize(sep.unsqueeze(0)).squeeze(0)
+                    repulse_mag = self.cfg.v_drone * repulse_gain * (1.0 - d / max(safe_dist, 1e-6))
+                    if is_expert2 and close_mode:
+                        rel_vel = drone_vel[i] - drone_vel[j]
+                        closing_speed = max(0.0, -torch.dot(rel_vel, repulse_dir).item())
+                        repulse_mag *= 1.0 + float(self.cfg.expert2_close_repulse_closing_boost) * min(
+                            closing_speed / max(self.cfg.v_drone, 1e-6), 1.0
+                        )
+                    v_des = v_des + repulse_mag * repulse_dir
+                    v_des = clip_vector_norm(v_des.unsqueeze(0), self.cfg.v_drone).squeeze(0)
+
+            # ── Universal floor guard: prevent ground contact ──
+            # Escalate to a guaranteed climb once we dip into the low-altitude band.
+            floor_safe_z = self.cfg.low_altitude_guard_z
+            cur_z = drone_pos[i, 2].item()
+            if cur_z < floor_safe_z:
+                floor_correction = 3.0 * (floor_safe_z - cur_z)
+                v_des[2] = max(v_des[2].item(), floor_correction)
+                v_des = clip_vector_norm(v_des.unsqueeze(0), self.cfg.v_drone).squeeze(0)
 
             quat_i = None if drone_quat is None else drone_quat[i]
-            heading_hint = to_wp
+            if rush_mode and i == rush_idx:
+                heading_hint = target_pos_pred - drone_pos[i]
+            else:
+                heading_hint = to_wp
             ti, oi, vi = self.vel_to_t_omega(
                 v_des,
                 drone_vel[i],
@@ -681,9 +851,45 @@ class ExpertPolicy:
             omega_list.append(oi)
             vel_cmd.append(vi)
 
-        return (torch.stack(t_list),
-                torch.stack(omega_list),
-                torch.stack(vel_cmd))
+        outputs = (
+            torch.stack(t_list),
+            torch.stack(omega_list),
+            torch.stack(vel_cmd),
+        )
+        if not return_debug:
+            return outputs
+
+        debug = {
+            "assignment": assignment.detach().clone(),
+            "waypoint": anchors[assignment].detach().clone(),
+            "target_pos_pred": target_pos_pred.detach().clone(),
+            "forward_dir": forward_dir.detach().clone(),
+            "trap_mode": torch.tensor(trap_mode, device=drone_pos.device),
+        }
+        return outputs + (debug,)
+
+
+def apply_strategy_defaults(
+    cfg: EnvCfg,
+    strategy_variant: str,
+    enable_goal_mode: Optional[bool] = None,
+    enable_close_mode: Optional[bool] = None,
+    enable_rush_mode: Optional[bool] = None,
+    expert2_front_layout: Optional[str] = None,
+) -> EnvCfg:
+    cfg.strategy_variant = strategy_variant
+    if strategy_variant == "expert2":
+        cfg.enable_goal_mode = False if enable_goal_mode is None else bool(enable_goal_mode)
+        cfg.enable_close_mode = True if enable_close_mode is None else bool(enable_close_mode)
+        cfg.enable_rush_mode = False if enable_rush_mode is None else bool(enable_rush_mode)
+        cfg.expert2_front_layout = expert2_front_layout or "symmetric"
+    else:
+        cfg.enable_goal_mode = True if enable_goal_mode is None else bool(enable_goal_mode)
+        cfg.enable_close_mode = True if enable_close_mode is None else bool(enable_close_mode)
+        cfg.enable_rush_mode = True if enable_rush_mode is None else bool(enable_rush_mode)
+        if expert2_front_layout is not None:
+            cfg.expert2_front_layout = expert2_front_layout
+    return cfg
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1012,8 +1218,24 @@ def main():
     )
     parser.add_argument("--n_episodes", type=int, default=50,
                         help="测试轮数（默认 50）")
-    parser.add_argument("--pred_mode", choices=["noise", "tp_net"], default="noise",
-                        help="目标预测模式: noise（加噪GT）或 tp_net（网络预测）")
+    parser.add_argument("--pred_mode", choices=["noise", "tp_net", "oracle_pos", "oracle_next"], default="noise",
+                        help="目标预测模式: noise（加噪GT）/ tp_net（网络预测）/ oracle_pos（真实当前位置）/ oracle_next（真实下一时刻）")
+    parser.add_argument("--forward_dir_mode", choices=["default", "motion_biased", "motion_only"], default="default",
+                        help="正面方向构造方式: default（守区+逃跑混合）/ motion_biased（逃跑方向占比更大）/ motion_only（纯逃跑方向）")
+    parser.add_argument("--strategy_variant", choices=["baseline", "expert2"], default="baseline",
+                        help="专家几何策略: baseline（当前版本）/ expert2（双前拦截+单后追捕）")
+    parser.add_argument("--enable_goal_mode", type=lambda x: x.lower() != "false", default=None,
+                        help="是否启用 goal-mode；expert2 默认 false，baseline 默认 true")
+    parser.add_argument("--enable_close_mode", type=lambda x: x.lower() != "false", default=None,
+                        help="是否启用 close mode；expert2 默认 true，baseline 默认 true")
+    parser.add_argument("--enable_rush_mode", type=lambda x: x.lower() != "false", default=None,
+                        help="是否启用 rush mode；expert2 默认 false，baseline 默认 true")
+    parser.add_argument("--expert2_front_layout", choices=["symmetric", "staggered"], default=None,
+                        help="expert2 双前拦截布局: symmetric（对称双侧）/ staggered（一个正前，一个前+侧偏）")
+    parser.add_argument("--expert_intercept_pred_step", type=int, default=5,
+                        help="专家拦截种子点使用第几步预测位置，默认 5 表示第5步")
+    parser.add_argument("--expert_intercept_use_direct_pred", type=lambda x: x.lower() != "false", default=False,
+                        help="若为 true，则 intercept_seed 直接等于选中的预测点；否则仍做 lookahead 外推")
     parser.add_argument("--tp_weight", type=str,
                         default="checkpoints/HideAndSeek_20260403_001241/tp_only_1690959872.pt",
                         help="TP_net 权重文件路径（pred_mode=tp_net 时使用）")
@@ -1030,6 +1252,17 @@ def main():
     print(f"  工作目录: {os.getcwd()}")
 
     tp_path = os.path.abspath(args.tp_weight)
+    CFG.forward_dir_mode = args.forward_dir_mode
+    apply_strategy_defaults(
+        CFG,
+        strategy_variant=args.strategy_variant,
+        enable_goal_mode=args.enable_goal_mode,
+        enable_close_mode=args.enable_close_mode,
+        enable_rush_mode=args.enable_rush_mode,
+        expert2_front_layout=args.expert2_front_layout,
+    )
+    CFG.expert_intercept_pred_step = int(args.expert_intercept_pred_step)
+    CFG.expert_intercept_use_direct_pred = bool(args.expert_intercept_use_direct_pred)
     if args.pred_mode == "tp_net" and not os.path.isfile(tp_path):
         print(f"[ERROR] tp_net 模式需要权重文件，但未找到: {tp_path}")
         print("  请切换为 --pred_mode noise 或提供正确路径。")

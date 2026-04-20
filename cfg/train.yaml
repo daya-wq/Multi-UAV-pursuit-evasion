@@ -8,6 +8,7 @@ env: ${task.env}
 
 model_dir: null
 tp_model_dir: null
+load_actor_tp_only: false
 load_history_dir: null
 
 total_frames: 30000_000_000 #1000_000_000

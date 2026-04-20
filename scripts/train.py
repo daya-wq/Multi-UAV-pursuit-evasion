@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 
@@ -116,6 +117,13 @@ def enable_prev_action_conditioning_cfg(cfg, hidden_dim: int):
         }
     )
 
+
+def load_torch_checkpoint(path: str, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
 class EpisodeStats:
     def __init__(self, in_keys: Sequence[str] = None):
         self.in_keys = in_keys
@@ -210,6 +218,7 @@ def main(cfg):
     
     # optionally discretize the action space or use a controller
     action_transform: str = cfg.task.get("action_transform", None)
+    action_controller = None
     if action_transform is not None:
         if action_transform.startswith("multidiscrete"):
             nbins = int(action_transform.split(":")[1])
@@ -223,12 +232,14 @@ def main(cfg):
             from omni_drones.controllers import LeePositionController
             from omni_drones.utils.torchrl.transforms import VelController
             controller = LeePositionController(9.81, base_env.drone.params).to(base_env.device)
+            action_controller = controller
             transform = VelController(controller)
             transforms.append(transform)
         elif action_transform == "attitude":
             from omni_drones.controllers import AttitudeController as Controller
             from omni_drones.utils.torchrl.transforms import AttitudeController
             controller = Controller(9.81, base_env.drone.params).to(base_env.device)
+            action_controller = controller
             transform = AttitudeController(controller)
             transforms.append(transform)
         elif action_transform == "rate":
@@ -236,6 +247,7 @@ def main(cfg):
             from omni_drones.utils.torchrl.transforms import RateController
             # from torch.distributions.transforms import TanhTransform
             controller = _RateController(9.81, base_env.drone.params).to(base_env.device)
+            action_controller = controller
             transform = RateController(controller)
             # transforms.append(TanhTransform)
             transforms.append(transform)
@@ -243,6 +255,7 @@ def main(cfg):
             from omni_drones.controllers import PIDRateController as _PIDRateController
             from omni_drones.utils.torchrl.transforms import PIDRateController
             controller = _PIDRateController(cfg.sim.dt, 9.81, base_env.drone.params).to(base_env.device)
+            action_controller = controller
             actor_has_tanh = bool(cfg.algo.actor.get("tanh", False))
             transform = PIDRateController(controller, actor_has_tanh=actor_has_tanh)
             # transforms.append(TanhTransform)
@@ -255,7 +268,7 @@ def main(cfg):
 
     checkpoint_state = None
     if cfg.model_dir is not None:
-        checkpoint_state = torch.load(cfg.model_dir, map_location="cpu")
+        checkpoint_state = load_torch_checkpoint(cfg.model_dir, map_location="cpu")
         if checkpoint_has_bc_aux(checkpoint_state):
             cfg.algo.actor.bc_aux.enabled = True
         checkpoint_rnn_hidden = checkpoint_actor_rnn_hidden_size(checkpoint_state)
@@ -277,16 +290,131 @@ def main(cfg):
 
     if checkpoint_state is not None:
         # torch.save(policy.state_dict(), ckpt_path)
-        policy.load_state_dict(checkpoint_state)
-        print("Successfully load model!")
+        if bool(cfg.get("load_actor_tp_only", False)):
+            if not hasattr(policy, "load_actor_tp_state_dict"):
+                raise ValueError("load_actor_tp_only=true requires policy.load_actor_tp_state_dict().")
+            policy.load_actor_tp_state_dict(checkpoint_state)
+            print("Successfully load actor+TP only; critic/value_normalizer kept freshly initialized.")
+        else:
+            policy.load_state_dict(checkpoint_state)
+            print("Successfully load model!")
     elif cfg.get("tp_model_dir", None) is not None:
         if not getattr(policy, "use_TP_net", False) or getattr(policy, "TP_net", None) is None:
             raise ValueError("tp_model_dir was provided, but the current policy does not use TP_net.")
-        tp_state = torch.load(cfg.tp_model_dir)
+        tp_state = load_torch_checkpoint(cfg.tp_model_dir)
         if isinstance(tp_state, dict) and "TP" in tp_state:
             tp_state = tp_state["TP"]
         policy.TP_net.load_state_dict(tp_state)
         print("Successfully load TP model!")
+
+    expert_kl_cfg = cfg.algo.get("warmstart", {}).get("expert_kl", None)
+    expert_kl_enabled = bool(expert_kl_cfg is not None and expert_kl_cfg.get("enabled", False))
+    expert_kl_policy = None
+    expert_kl_policy_cfg = None
+    if expert_kl_enabled:
+        if action_transform != "PIDrate" or action_controller is None:
+            raise ValueError("expert_kl currently expects task.action_transform=PIDrate.")
+        from expert_isaac_eval import (
+            BatchedExpertPolicy,
+            SharedExpertCfg,
+            apply_shared_strategy_defaults,
+        )
+
+        expert_kl_policy_cfg = SharedExpertCfg()
+        expert_kl_policy_cfg.dt = float(cfg.sim.dt)
+        expert_kl_policy_cfg.num_agents = int(base_env.drone.n)
+        expert_kl_policy_cfg.arena_size = float(base_env.arena_size)
+        expert_kl_policy_cfg.max_height = float(base_env.max_height)
+        expert_kl_policy_cfg.max_episode_length = int(base_env.max_episode_length)
+        expert_kl_policy_cfg.v_drone = float(getattr(base_env, "current_pursuer_speed", cfg.task.v_drone))
+        expert_kl_policy_cfg.catch_radius = float(cfg.task.catch_radius)
+        expert_kl_policy_cfg.goal_region_center = base_env.goal_region_center.to(base_env.device)
+        expert_kl_policy_cfg.goal_region_radius = float(cfg.task.goal_region_radius)
+        expert_kl_policy_cfg.goal_region_height = float(cfg.task.goal_region_height)
+        expert_kl_policy_cfg.hover_thrust_ratio = float(
+            (base_env.drone.gravity[0, 0] / action_controller.max_thrusts.sum()).item()
+        )
+        expert_kl_policy_cfg.min_thrust_ratio = float(action_controller.min_thrust_ratio)
+        expert_kl_policy_cfg.max_thrust_ratio = float(action_controller.max_thrust_ratio)
+        expert_kl_policy_cfg.target_clip = float(action_controller.target_clip)
+        expert_kl_policy_cfg.max_body_rate_rad_s = math.radians(180.0 * expert_kl_policy_cfg.target_clip)
+        expert_kl_policy_cfg.forward_dir_mode = str(expert_kl_cfg.get("forward_dir_mode", "default"))
+        apply_shared_strategy_defaults(
+            expert_kl_policy_cfg,
+            strategy_variant=str(expert_kl_cfg.get("strategy_variant", "expert2")),
+            enable_goal_mode=expert_kl_cfg.get("enable_goal_mode", False),
+            enable_close_mode=expert_kl_cfg.get("enable_close_mode", True),
+            enable_rush_mode=expert_kl_cfg.get("enable_rush_mode", False),
+            expert2_front_layout=str(expert_kl_cfg.get("expert2_front_layout", "symmetric")),
+        )
+        if hasattr(base_env, "history_step"):
+            expert_kl_policy_cfg.history_step = int(base_env.history_step)
+        if hasattr(base_env, "future_predcition_step"):
+            expert_kl_policy_cfg.future_predcition_step = int(base_env.future_predcition_step)
+        if hasattr(base_env, "window_step"):
+            expert_kl_policy_cfg.window_step = int(base_env.window_step)
+
+        expert_kl_pred_mode = str(expert_kl_cfg.get("pred_mode", "oracle_pos"))
+        expert_kl_tp_weight = str(expert_kl_cfg.get("tp_weight", "") or cfg.get("tp_model_dir", "") or "")
+        expert_kl_policy = BatchedExpertPolicy(
+            expert_kl_policy_cfg,
+            pred_mode=expert_kl_pred_mode,
+            tp_weight_path=expert_kl_tp_weight,
+            tp_device=str(cfg.sim.device),
+        )
+        logging.info(
+            "Expert KL enabled: coef_init=%s coef_final=%s decay_frames=%s pred_mode=%s strategy=%s close=%s rush=%s layout=%s",
+            expert_kl_cfg.get("coef_init", 0.0),
+            expert_kl_cfg.get("coef_final", 0.0),
+            expert_kl_cfg.get("decay_frames", 0),
+            expert_kl_pred_mode,
+            expert_kl_policy_cfg.strategy_variant,
+            expert_kl_policy_cfg.enable_close_mode,
+            expert_kl_policy_cfg.enable_rush_mode,
+            expert_kl_policy_cfg.expert2_front_layout,
+        )
+
+    @torch.no_grad()
+    def attach_expert_kl_actions(tensordict: TensorDictBase):
+        if expert_kl_policy is None:
+            return tensordict
+        if ("info", "target_state") not in tensordict.keys(True):
+            raise KeyError("expert_kl requires ('info', 'target_state') in rollout tensordict.")
+
+        num_envs, horizon = tensordict.batch_size[:2]
+        n_agents = int(base_env.drone.n)
+        expert_kl_policy_cfg.v_drone = float(getattr(base_env, "current_pursuer_speed", cfg.task.v_drone))
+        expert_kl_policy.reset(int(num_envs))
+
+        drone_state = tensordict[("info", "drone_state")]
+        target_state = tensordict[("info", "target_state")]
+        expert_actions = []
+        for step_idx in range(int(horizon)):
+            drone_state_step = drone_state[:, step_idx]
+            target_state_step = target_state[:, step_idx]
+            drone_pos = drone_state_step[..., :3]
+            drone_quat = drone_state_step[..., 3:7]
+            drone_vel = drone_state_step[..., 7:10]
+            target_pos = target_state_step[..., :3]
+            target_vel = target_state_step[..., 3:6]
+            target_next_pos = target_pos + target_vel * float(cfg.sim.dt)
+            t_cmd, omega_cmd, _ = expert_kl_policy.get_actions_batch(
+                step=step_idx,
+                drone_pos=drone_pos,
+                drone_vel=drone_vel,
+                target_pos=target_pos,
+                target_vel=target_vel,
+                target_next_pos=target_next_pos,
+                drone_quat=drone_quat,
+                return_debug=False,
+            )
+            expert_action = expert_kl_policy.t_omega_to_pidrate_action(
+                t_cmd.reshape(-1),
+                omega_cmd.reshape(-1, 3),
+            ).reshape(num_envs, n_agents, 4)
+            expert_actions.append(expert_action)
+        tensordict[("agents", "expert_action")] = torch.stack(expert_actions, dim=1)
+        return tensordict
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True) 
@@ -371,6 +499,191 @@ def main(cfg):
             "train/stats.success_ema_for_entropy": float(entropy_success_ema or 0.0),
         }
 
+    warmstart_cfg = cfg.algo.get("warmstart", None)
+    actor_freeze_cfg = warmstart_cfg.get("actor_freeze", None) if warmstart_cfg is not None else None
+    actor_lr_warmup_cfg = warmstart_cfg.get("actor_lr_warmup", None) if warmstart_cfg is not None else None
+    critic_lr_warmup_cfg = warmstart_cfg.get("critic_lr_warmup", None) if warmstart_cfg is not None else None
+    actor_log_std_schedule_cfg = (
+        warmstart_cfg.get("actor_log_std_schedule", None) if warmstart_cfg is not None else None
+    )
+    kl_reg_cfg = warmstart_cfg.get("kl_reg", None) if warmstart_cfg is not None else None
+    anchor_cfg = warmstart_cfg.get("anchor", None) if warmstart_cfg is not None else None
+    expert_kl_cfg = warmstart_cfg.get("expert_kl", None) if warmstart_cfg is not None else None
+
+    actor_freeze_enabled = bool(actor_freeze_cfg is not None and actor_freeze_cfg.get("enabled", False))
+    actor_freeze_frames = int(actor_freeze_cfg.get("frames", 0)) if actor_freeze_enabled else 0
+    curriculum_cfg = getattr(cfg.task, "curriculum", None)
+    curriculum_eval_promote_cfg = (
+        getattr(curriculum_cfg, "eval_promote", None) if curriculum_cfg is not None else None
+    )
+    curriculum_eval_promote_enabled = bool(
+        curriculum_eval_promote_cfg is not None
+        and curriculum_eval_promote_cfg.get("enabled", False)
+    )
+    curriculum_eval_promote_after_actor_freeze = bool(
+        curriculum_eval_promote_cfg.get("after_actor_freeze", True)
+        if curriculum_eval_promote_cfg is not None
+        else True
+    )
+    curriculum_eval_success_threshold = float(
+        curriculum_eval_promote_cfg.get("success_threshold", 0.80)
+        if curriculum_eval_promote_cfg is not None
+        else 0.80
+    )
+    curriculum_eval_max_pursuer_collisions_count = float(
+        curriculum_eval_promote_cfg.get("max_pursuer_collisions_count", 1.0)
+        if curriculum_eval_promote_cfg is not None
+        else 1.0
+    )
+    curriculum_eval_promote_consecutive = int(
+        curriculum_eval_promote_cfg.get("consecutive_evals", 1)
+        if curriculum_eval_promote_cfg is not None
+        else 1
+    )
+    curriculum_eval_promote_consecutive = max(curriculum_eval_promote_consecutive, 1)
+    curriculum_eval_promote_streak = 0
+    curriculum_stage_start_frames = 0
+
+    actor_lr_warmup_enabled = bool(actor_lr_warmup_cfg is not None and actor_lr_warmup_cfg.get("enabled", False))
+    actor_lr_warmup_frames = int(actor_lr_warmup_cfg.get("frames", 0)) if actor_lr_warmup_enabled else 0
+    actor_lr_warmup_init = float(actor_lr_warmup_cfg.get("lr_init", cfg.algo.actor.lr)) if actor_lr_warmup_enabled else float(cfg.algo.actor.lr)
+    actor_lr_warmup_final = float(actor_lr_warmup_cfg.get("lr_final", cfg.algo.actor.lr)) if actor_lr_warmup_enabled else float(cfg.algo.actor.lr)
+
+    critic_lr_warmup_enabled = bool(critic_lr_warmup_cfg is not None and critic_lr_warmup_cfg.get("enabled", False))
+    critic_lr_warmup_frames = int(critic_lr_warmup_cfg.get("frames", 0)) if critic_lr_warmup_enabled else 0
+    critic_lr_warmup_init = float(critic_lr_warmup_cfg.get("lr_init", cfg.algo.critic.lr)) if critic_lr_warmup_enabled else float(cfg.algo.critic.lr)
+    critic_lr_warmup_final = float(critic_lr_warmup_cfg.get("lr_final", cfg.algo.critic.lr)) if critic_lr_warmup_enabled else float(cfg.algo.critic.lr)
+
+    actor_log_std_schedule_enabled = bool(
+        actor_log_std_schedule_cfg is not None
+        and actor_log_std_schedule_cfg.get("enabled", False)
+    )
+    actor_log_std_schedule_reset_on_stage = bool(
+        actor_log_std_schedule_cfg is not None
+        and actor_log_std_schedule_cfg.get("reset_on_curriculum_stage", False)
+    )
+    actor_log_std_schedule_frames = (
+        [int(x) for x in actor_log_std_schedule_cfg.get("frames", [0])]
+        if actor_log_std_schedule_enabled
+        else [0]
+    )
+    actor_log_std_schedule_values = (
+        [float(x) for x in actor_log_std_schedule_cfg.get("values", [cfg.algo.actor.log_std_init])]
+        if actor_log_std_schedule_enabled
+        else [float(cfg.algo.actor.log_std_init)]
+    )
+    if len(actor_log_std_schedule_frames) != len(actor_log_std_schedule_values):
+        raise ValueError("warmstart.actor_log_std_schedule frames and values must have the same length.")
+    actor_log_std_adaptive_cfg = (
+        actor_log_std_schedule_cfg.get("adaptive_release", None)
+        if actor_log_std_schedule_cfg is not None
+        else None
+    )
+    actor_log_std_adaptive_enabled = bool(
+        actor_log_std_schedule_enabled
+        and actor_log_std_adaptive_cfg is not None
+        and actor_log_std_adaptive_cfg.get("enabled", False)
+    )
+    actor_log_std_adaptive_min_frames = int(
+        actor_log_std_adaptive_cfg.get("min_frames", 100_000_000)
+        if actor_log_std_adaptive_cfg is not None
+        else 100_000_000
+    )
+    actor_log_std_adaptive_success_threshold = float(
+        actor_log_std_adaptive_cfg.get("success_threshold", 0.70)
+        if actor_log_std_adaptive_cfg is not None
+        else 0.70
+    )
+    actor_log_std_adaptive_mse_threshold = float(
+        actor_log_std_adaptive_cfg.get("mse_threshold", 0.01)
+        if actor_log_std_adaptive_cfg is not None
+        else 0.01
+    )
+    actor_log_std_adaptive_consecutive = int(
+        actor_log_std_adaptive_cfg.get("consecutive_evals", 1)
+        if actor_log_std_adaptive_cfg is not None
+        else 1
+    )
+    actor_log_std_adaptive_consecutive = max(actor_log_std_adaptive_consecutive, 1)
+    actor_log_std_adaptive_step_frames = int(
+        actor_log_std_adaptive_cfg.get("step_frames", 20_000_000)
+        if actor_log_std_adaptive_cfg is not None
+        else 20_000_000
+    )
+    actor_log_std_adaptive_step_frames = max(actor_log_std_adaptive_step_frames, 1)
+    actor_log_std_adaptive_init_std = float(
+        actor_log_std_adaptive_cfg.get("init_std", math.exp(actor_log_std_schedule_values[0]))
+        if actor_log_std_adaptive_cfg is not None
+        else math.exp(actor_log_std_schedule_values[0])
+    )
+    actor_log_std_adaptive_std_increment = float(
+        actor_log_std_adaptive_cfg.get("std_increment", 0.01)
+        if actor_log_std_adaptive_cfg is not None
+        else 0.01
+    )
+    actor_log_std_adaptive_max_std = float(
+        actor_log_std_adaptive_cfg.get("max_std", 0.05)
+        if actor_log_std_adaptive_cfg is not None
+        else 0.05
+    )
+    actor_log_std_adaptive_streak = 0
+    actor_log_std_adaptive_unlocked_frame = None if actor_log_std_adaptive_enabled else 0
+
+    kl_reg_enabled = bool(kl_reg_cfg is not None and kl_reg_cfg.get("enabled", False))
+    kl_target = float(kl_reg_cfg.get("target_kl", 0.01)) if kl_reg_enabled else None
+    kl_coef = float(kl_reg_cfg.get("coef", 0.0)) if kl_reg_enabled else 0.0
+    kl_hard_stop = bool(kl_reg_cfg.get("hard_stop", False)) if kl_reg_enabled else False
+    if hasattr(policy, "set_kl_reg"):
+        policy.set_kl_reg(kl_target, kl_coef, kl_hard_stop)
+
+    anchor_enabled = bool(anchor_cfg is not None and anchor_cfg.get("enabled", False))
+    anchor_coef_init = float(anchor_cfg.get("coef_init", 0.0)) if anchor_enabled else 0.0
+    anchor_coef_final = float(anchor_cfg.get("coef_final", 0.0)) if anchor_enabled else 0.0
+    anchor_decay_frames = int(anchor_cfg.get("decay_frames", 0)) if anchor_enabled else 0
+    anchor_loss_type = str(anchor_cfg.get("loss_type", "mse")) if anchor_enabled else "mse"
+    if anchor_enabled and checkpoint_state is not None and hasattr(policy, "capture_anchor_actor"):
+        policy.capture_anchor_actor()
+        policy.set_anchor_loss(anchor_coef_init, anchor_loss_type)
+
+    expert_kl_enabled = bool(expert_kl_cfg is not None and expert_kl_cfg.get("enabled", False))
+    expert_kl_coef_init = float(expert_kl_cfg.get("coef_init", 0.0)) if expert_kl_enabled else 0.0
+    expert_kl_coef_final = float(expert_kl_cfg.get("coef_final", 0.0)) if expert_kl_enabled else 0.0
+    expert_kl_decay_frames = int(expert_kl_cfg.get("decay_frames", 0)) if expert_kl_enabled else 0
+    expert_kl_loss_type = str(expert_kl_cfg.get("loss_type", "nll")) if expert_kl_enabled else "nll"
+    expert_kl_max_loss = expert_kl_cfg.get("max_loss", None) if expert_kl_enabled else None
+    expert_kl_reset_on_stage = bool(
+        expert_kl_cfg is not None and expert_kl_cfg.get("reset_on_curriculum_stage", False)
+    )
+    expert_kl_decay_gate_cfg = (
+        expert_kl_cfg.get("decay_after_eval_success", None)
+        if expert_kl_cfg is not None
+        else None
+    )
+    expert_kl_decay_gate_enabled = bool(
+        expert_kl_decay_gate_cfg is not None
+        and expert_kl_decay_gate_cfg.get("enabled", False)
+    )
+    expert_kl_decay_gate_success_threshold = float(
+        expert_kl_decay_gate_cfg.get("success_threshold", 0.60)
+        if expert_kl_decay_gate_cfg is not None
+        else 0.60
+    )
+    expert_kl_decay_gate_consecutive = int(
+        expert_kl_decay_gate_cfg.get("consecutive_evals", 3)
+        if expert_kl_decay_gate_cfg is not None
+        else 3
+    )
+    expert_kl_decay_gate_consecutive = max(expert_kl_decay_gate_consecutive, 1)
+    expert_kl_decay_gate_min_frames = int(
+        expert_kl_decay_gate_cfg.get("min_frames", actor_freeze_frames)
+        if expert_kl_decay_gate_cfg is not None
+        else actor_freeze_frames
+    )
+    expert_kl_decay_gate_streak = 0
+    expert_kl_decay_unlocked_frame = None if expert_kl_decay_gate_enabled else 0
+    if expert_kl_enabled and hasattr(policy, "set_expert_kl_loss"):
+        policy.set_expert_kl_loss(expert_kl_coef_init, expert_kl_loss_type, expert_kl_max_loss)
+
     def training_progress(frames: int, iteration: int) -> float:
         if total_frames > 0:
             return min(float(frames) / float(total_frames), 1.0)
@@ -378,8 +691,282 @@ def main(cfg):
             return min(float(iteration + 1) / float(max_iters), 1.0)
         return 0.0
 
+    def interpolate_schedule(current_frames: int, frames: list, values: list) -> float:
+        if not frames:
+            raise ValueError("Schedule frames cannot be empty.")
+        if current_frames <= frames[0] or len(frames) == 1:
+            return float(values[0])
+        for idx in range(1, len(frames)):
+            if current_frames <= frames[idx]:
+                left_frame = float(frames[idx - 1])
+                right_frame = float(frames[idx])
+                span = max(right_frame - left_frame, 1.0)
+                progress = (float(current_frames) - left_frame) / span
+                return float(values[idx - 1]) + (
+                    float(values[idx]) - float(values[idx - 1])
+                ) * progress
+        return float(values[-1])
+
+    def update_warmstart_controls(current_frames: int):
+        info = {}
+        if hasattr(policy, "set_actor_frozen"):
+            actor_frozen = bool(actor_freeze_enabled and current_frames < actor_freeze_frames)
+            policy.set_actor_frozen(actor_frozen)
+            info["drone/actor_frozen"] = float(actor_frozen)
+
+        if hasattr(policy, "set_actor_lr"):
+            if actor_lr_warmup_enabled and actor_lr_warmup_frames > 0 and current_frames < actor_lr_warmup_frames:
+                progress = float(current_frames) / float(max(actor_lr_warmup_frames, 1))
+                actor_lr = actor_lr_warmup_init + (actor_lr_warmup_final - actor_lr_warmup_init) * progress
+            else:
+                actor_lr = actor_lr_warmup_final
+            policy.set_actor_lr(actor_lr)
+            info["drone/effective_actor_lr"] = float(actor_lr)
+
+        if hasattr(policy, "set_critic_lr"):
+            if critic_lr_warmup_enabled and critic_lr_warmup_frames > 0 and current_frames < critic_lr_warmup_frames:
+                progress = float(current_frames) / float(max(critic_lr_warmup_frames, 1))
+                critic_lr = critic_lr_warmup_init + (critic_lr_warmup_final - critic_lr_warmup_init) * progress
+            else:
+                critic_lr = critic_lr_warmup_final
+            policy.set_critic_lr(critic_lr)
+            info["drone/effective_critic_lr"] = float(critic_lr)
+
+        if actor_log_std_schedule_enabled and hasattr(policy, "set_actor_log_std"):
+            schedule_frames = (
+                max(0, current_frames - curriculum_stage_start_frames)
+                if actor_log_std_schedule_reset_on_stage
+                else current_frames
+            )
+            if actor_log_std_adaptive_enabled:
+                if actor_log_std_adaptive_unlocked_frame is None:
+                    release_frames = 0
+                    actor_std = actor_log_std_adaptive_init_std
+                else:
+                    release_frames = max(0, current_frames - int(actor_log_std_adaptive_unlocked_frame))
+                    release_steps = release_frames // actor_log_std_adaptive_step_frames
+                    actor_std = min(
+                        actor_log_std_adaptive_init_std
+                        + actor_log_std_adaptive_std_increment * release_steps,
+                        actor_log_std_adaptive_max_std,
+                    )
+                actor_log_std = math.log(max(actor_std, 1e-6))
+            else:
+                release_frames = schedule_frames
+                actor_std = math.exp(actor_log_std_schedule_values[0])
+                actor_log_std = interpolate_schedule(
+                    schedule_frames,
+                    actor_log_std_schedule_frames,
+                    actor_log_std_schedule_values,
+                )
+            applied_log_std = policy.set_actor_log_std(actor_log_std)
+            if applied_log_std is not None:
+                info["drone/effective_actor_log_std_target"] = float(applied_log_std)
+                info["drone/effective_actor_log_std_stage_frames"] = float(schedule_frames)
+                info["drone/effective_actor_std_target"] = float(math.exp(applied_log_std))
+                if actor_log_std_adaptive_enabled:
+                    info["drone/actor_log_std_adaptive_unlocked"] = float(
+                        actor_log_std_adaptive_unlocked_frame is not None
+                    )
+                    info["drone/actor_log_std_adaptive_release_frames"] = float(release_frames)
+                    info["drone/actor_log_std_adaptive_gate_streak"] = float(actor_log_std_adaptive_streak)
+
+        if anchor_enabled and hasattr(policy, "set_anchor_loss"):
+            if anchor_decay_frames > 0:
+                decay_progress = min(float(current_frames) / float(anchor_decay_frames), 1.0)
+            else:
+                decay_progress = 1.0
+            anchor_coef = anchor_coef_init + (anchor_coef_final - anchor_coef_init) * decay_progress
+            policy.set_anchor_loss(anchor_coef, anchor_loss_type)
+            info["drone/effective_anchor_coef"] = float(anchor_coef)
+
+        if expert_kl_enabled and hasattr(policy, "set_expert_kl_loss"):
+            if expert_kl_decay_frames > 0:
+                if expert_kl_decay_gate_enabled:
+                    if expert_kl_decay_unlocked_frame is None:
+                        kl_frames = 0
+                    else:
+                        kl_frames = max(0, current_frames - int(expert_kl_decay_unlocked_frame))
+                else:
+                    kl_frames = (
+                        max(0, current_frames - curriculum_stage_start_frames)
+                        if expert_kl_reset_on_stage
+                        else current_frames
+                    )
+                decay_progress = min(float(kl_frames) / float(expert_kl_decay_frames), 1.0)
+            else:
+                kl_frames = current_frames
+                decay_progress = 1.0
+            expert_kl_coef = expert_kl_coef_init + (
+                expert_kl_coef_final - expert_kl_coef_init
+            ) * decay_progress
+            policy.set_expert_kl_loss(expert_kl_coef, expert_kl_loss_type, expert_kl_max_loss)
+            info["drone/effective_expert_kl_coef"] = float(expert_kl_coef)
+            info["drone/effective_expert_kl_stage_frames"] = float(kl_frames)
+            if hasattr(policy, "expert_kl_fixed_std"):
+                info["drone/effective_expert_kl_fixed_std"] = float(policy.expert_kl_fixed_std)
+            if expert_kl_decay_gate_enabled:
+                info["drone/expert_kl_decay_gate_unlocked"] = float(expert_kl_decay_unlocked_frame is not None)
+                info["drone/expert_kl_decay_gate_streak"] = float(expert_kl_decay_gate_streak)
+
+        if kl_reg_enabled:
+            info["drone/kl_target"] = float(kl_target)
+            info["drone/kl_coef"] = float(kl_coef)
+        return info
+
+    def update_expert_kl_decay_gate(eval_info: dict, current_frames: int):
+        nonlocal expert_kl_decay_gate_streak, expert_kl_decay_unlocked_frame
+
+        if not (expert_kl_enabled and expert_kl_decay_gate_enabled):
+            return {}
+
+        success = float(eval_info.get("eval/stats.success", float("nan")))
+        if math.isnan(success):
+            success = 0.0
+
+        eligible = current_frames >= expert_kl_decay_gate_min_frames
+        passed = eligible and success >= expert_kl_decay_gate_success_threshold
+        if expert_kl_decay_unlocked_frame is None:
+            expert_kl_decay_gate_streak = expert_kl_decay_gate_streak + 1 if passed else 0
+            if expert_kl_decay_gate_streak >= expert_kl_decay_gate_consecutive:
+                expert_kl_decay_unlocked_frame = int(current_frames)
+                logging.info(
+                    "[Expert KL] decay unlocked at %d frames | success=%.3f | threshold=%.3f | streak=%d",
+                    current_frames,
+                    success,
+                    expert_kl_decay_gate_success_threshold,
+                    expert_kl_decay_gate_streak,
+                )
+
+        return {
+            "drone/expert_kl_decay_gate_eligible": float(eligible),
+            "drone/expert_kl_decay_gate_pass": float(passed),
+            "drone/expert_kl_decay_gate_streak": float(expert_kl_decay_gate_streak),
+            "drone/expert_kl_decay_gate_unlocked": float(expert_kl_decay_unlocked_frame is not None),
+            "drone/expert_kl_decay_gate_success_threshold": float(expert_kl_decay_gate_success_threshold),
+        }
+
+    def update_actor_log_std_adaptive_gate(eval_info: dict, current_frames: int):
+        nonlocal actor_log_std_adaptive_streak, actor_log_std_adaptive_unlocked_frame
+
+        if not actor_log_std_adaptive_enabled:
+            return {}
+
+        success = float(eval_info.get("eval/stats.success", float("nan")))
+        if math.isnan(success):
+            success = 0.0
+        expert_mse_ema = getattr(policy, "expert_kl_mse_ema", None)
+        expert_mse_ema = float("inf") if expert_mse_ema is None else float(expert_mse_ema)
+
+        eligible = current_frames >= actor_log_std_adaptive_min_frames
+        passed = (
+            eligible
+            and success >= actor_log_std_adaptive_success_threshold
+            and expert_mse_ema <= actor_log_std_adaptive_mse_threshold
+        )
+        if actor_log_std_adaptive_unlocked_frame is None:
+            actor_log_std_adaptive_streak = actor_log_std_adaptive_streak + 1 if passed else 0
+            if actor_log_std_adaptive_streak >= actor_log_std_adaptive_consecutive:
+                actor_log_std_adaptive_unlocked_frame = int(current_frames)
+                logging.info(
+                    "[Actor std] adaptive release unlocked at %d frames | success=%.3f | expert_mse_ema=%.5f",
+                    current_frames,
+                    success,
+                    expert_mse_ema,
+                )
+
+        return {
+            "drone/actor_log_std_adaptive_gate_eligible": float(eligible),
+            "drone/actor_log_std_adaptive_gate_pass": float(passed),
+            "drone/actor_log_std_adaptive_gate_streak": float(actor_log_std_adaptive_streak),
+            "drone/actor_log_std_adaptive_gate_unlocked": float(
+                actor_log_std_adaptive_unlocked_frame is not None
+            ),
+            "drone/actor_log_std_adaptive_gate_success_threshold": float(
+                actor_log_std_adaptive_success_threshold
+            ),
+            "drone/actor_log_std_adaptive_gate_mse_threshold": float(
+                actor_log_std_adaptive_mse_threshold
+            ),
+            "drone/actor_log_std_adaptive_gate_mse_ema": float(expert_mse_ema),
+        }
+
+    def update_curriculum_from_eval(eval_info: dict, current_frames: int):
+        nonlocal curriculum_eval_promote_streak, curriculum_stage_start_frames
+        nonlocal expert_kl_decay_gate_streak, expert_kl_decay_unlocked_frame
+        nonlocal actor_log_std_adaptive_streak, actor_log_std_adaptive_unlocked_frame
+
+        info = {}
+        current_stage = int(getattr(base_env, "curriculum_stage", 0))
+        stages = getattr(base_env, "curriculum_stages", [])
+        num_stages = len(stages)
+        info["drone/curriculum_stage_after_eval"] = float(current_stage + 1)
+
+        if not curriculum_eval_promote_enabled or not hasattr(base_env, "_set_curriculum_stage"):
+            return info
+        if num_stages <= 1 or current_stage >= num_stages - 1:
+            info["drone/curriculum_eval_promote_eligible"] = 0.0
+            info["drone/curriculum_eval_promote_pass"] = 0.0
+            info["drone/curriculum_eval_promote_streak"] = float(curriculum_eval_promote_streak)
+            info["drone/curriculum_eval_promoted"] = 0.0
+            return info
+
+        freeze_done = (not curriculum_eval_promote_after_actor_freeze) or (
+            current_frames >= actor_freeze_frames
+        )
+        success = float(eval_info.get("eval/stats.success", float("nan")))
+        pursuer_collision_count = float(
+            eval_info.get("eval/stats.pursuer_collisions_count", float("inf"))
+        )
+        if math.isnan(success):
+            success = 0.0
+        if math.isnan(pursuer_collision_count):
+            pursuer_collision_count = float("inf")
+
+        passed = (
+            freeze_done
+            and success >= curriculum_eval_success_threshold
+            and pursuer_collision_count < curriculum_eval_max_pursuer_collisions_count
+        )
+        curriculum_eval_promote_streak = (
+            curriculum_eval_promote_streak + 1 if passed else 0
+        )
+        promoted = 0.0
+        if curriculum_eval_promote_streak >= curriculum_eval_promote_consecutive:
+            next_stage = current_stage + 1
+            base_env._set_curriculum_stage(next_stage, reset_metrics=True, announce=True)
+            current_stage = int(getattr(base_env, "curriculum_stage", next_stage))
+            curriculum_stage_start_frames = int(current_frames)
+            curriculum_eval_promote_streak = 0
+            if expert_kl_decay_gate_enabled and expert_kl_reset_on_stage:
+                expert_kl_decay_gate_streak = 0
+                expert_kl_decay_unlocked_frame = None
+            if actor_log_std_adaptive_enabled and actor_log_std_schedule_reset_on_stage:
+                actor_log_std_adaptive_streak = 0
+                actor_log_std_adaptive_unlocked_frame = None
+            promoted = 1.0
+            logging.info(
+                "[Curriculum] eval-promoted to stage %d at %d frames | success=%.3f | pursuer_collisions_count=%.3f",
+                current_stage + 1,
+                current_frames,
+                success,
+                pursuer_collision_count,
+            )
+
+        info["drone/curriculum_eval_promote_eligible"] = float(freeze_done)
+        info["drone/curriculum_eval_promote_pass"] = float(passed)
+        info["drone/curriculum_eval_promote_streak"] = float(curriculum_eval_promote_streak)
+        info["drone/curriculum_eval_promoted"] = float(promoted)
+        info["drone/curriculum_eval_success_threshold"] = float(curriculum_eval_success_threshold)
+        info["drone/curriculum_eval_max_pursuer_collisions_count"] = float(
+            curriculum_eval_max_pursuer_collisions_count
+        )
+        info["drone/curriculum_stage_after_eval"] = float(current_stage + 1)
+        return info
+
     if hasattr(base_env, "set_training_progress"):
         base_env.set_training_progress(0.0)
+    update_warmstart_controls(0)
 
     @torch.no_grad()
     def evaluate(
@@ -406,33 +993,45 @@ def main(cfg):
                 frames.append(frame)
             t.update(2)
 
-        rollout_callback = Every(record_frame, 2) if record_eval_video else None
-        trajs = env.rollout(
-            max_steps=base_env.max_episode_length,
-            policy=lambda x: policy(x, deterministic=True),
-            callback=rollout_callback,
-            auto_reset=True,
-            break_when_any_done=False,
-            return_contiguous=False
-        ).clone()
-        # np.save('track.npy', trajs[0]['stats']['drone_state'].to('cpu').numpy())
+        if hasattr(policy, "reset_prev_action_cache"):
+            policy.reset_prev_action_cache()
+
+        td = env.reset()
+        n_envs = int(base_env.num_envs)
+        n_agents = int(base_env.drone.n)
+        done_mask = torch.zeros(n_envs, dtype=torch.bool, device=base_env.device)
+        zero_action = torch.zeros(n_envs, n_agents, 4, device=base_env.device)
+        eval_stats = []
+        latest_stats = None
+        for step_idx in range(base_env.max_episode_length):
+            if record_eval_video and step_idx % 2 == 0:
+                record_frame()
+            action_td = policy(td, deterministic=True)
+            if done_mask.any() and ("agents", "action") in action_td.keys(True):
+                action_td["agents", "action"][done_mask] = zero_action[done_mask]
+            td = env.step(action_td)
+            td_next = td.get("next")
+            latest_stats = td_next.get("stats")
+            done_vec = td_next.get("done").reshape(n_envs).bool()
+            newly_done = done_vec & ~done_mask
+            if newly_done.any():
+                eval_stats.extend(latest_stats[newly_done].detach().clone().unbind(0))
+                done_mask |= newly_done
+            if done_mask.all():
+                break
+            td = td_next
+
+        if latest_stats is not None and (~done_mask).any():
+            eval_stats.extend(latest_stats[~done_mask].detach().clone().unbind(0))
+        if hasattr(policy, "reset_prev_action_cache"):
+            policy.reset_prev_action_cache()
 
         base_env.enable_render(not cfg.headless)
         if hasattr(base_env, "set_training_progress"):
             base_env.set_training_progress(prev_progress)
         env.reset()
 
-        done = trajs.get(("next", "done"))
-        first_done = torch.argmax(done.long(), dim=1).cpu()
-
-        def take_first_episode(tensor: torch.Tensor):
-            indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
-            return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-        traj_stats = {
-            k: take_first_episode(v)
-            for k, v in trajs[("next", "stats")].cpu().items()
-        }
+        traj_stats = torch.stack(eval_stats).to_tensordict().cpu()
 
         info = {
             "eval/stats." + k: torch.nanmean(v.float()).item() 
@@ -451,11 +1050,13 @@ def main(cfg):
 
     pbar = tqdm(collector)
     env.train()
+    base_env.train()
     fps = []
     for i, data in enumerate(pbar):
         # fps.append(collector._fps)
+        data_td = data.to_tensordict()
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
-        episode_stats(data.to_tensordict())
+        episode_stats(data_td)
         stats = {}
 
         if len(episode_stats) >= base_env.num_envs:
@@ -466,13 +1067,20 @@ def main(cfg):
             info.update(stats)
 
         info.update(update_entropy_schedule(collector._frames, stats))
-        
-        info.update(policy.train_op(data.to_tensordict()))
+        info.update(update_warmstart_controls(collector._frames))
+
+        attach_expert_kl_actions(data_td)
+        info.update(policy.train_op(data_td))
 
         if eval_interval > 0 and i % eval_interval == 0:
             logging.info(f"Eval at {collector._frames} steps.")
-            info.update(evaluate(progress=training_progress(collector._frames, i)))
+            eval_info = evaluate(progress=training_progress(collector._frames, i))
+            info.update(eval_info)
+            info.update(update_expert_kl_decay_gate(eval_info, collector._frames))
+            info.update(update_actor_log_std_adaptive_gate(eval_info, collector._frames))
+            info.update(update_curriculum_from_eval(eval_info, collector._frames))
             env.train()
+            base_env.train()
 
         if save_interval > 0 and i % save_interval == 0:
             if hasattr(policy, "state_dict"):

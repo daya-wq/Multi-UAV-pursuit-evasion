@@ -5,6 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PRED_MODE="${PRED_MODE:-tp_net}"
 V_PREY_TEST="${V_PREY_TEST:-1.5}"
+V_PREY_SCHEDULE="${V_PREY_SCHEDULE:-}"
 V_DRONE_TEST="${V_DRONE_TEST:-1.5}"
 EPISODE_LENGTH="${EPISODE_LENGTH:-1000}"
 EVAL_GPU="${EVAL_GPU:-0}"
@@ -14,6 +15,14 @@ NUM_WAVES="${NUM_WAVES:-100}"
 MIN_SUCCESS_STEPS="${MIN_SUCCESS_STEPS:-1}"
 DATASET_DTYPE="${DATASET_DTYPE:-float16}"
 DATASET_ROOT="${DATASET_ROOT:-${PROJECT_ROOT}/expert_datasets}"
+DATASET_NAME="${DATASET_NAME:-}"
+GENERIC_SEED_BASE="${GENERIC_SEED_BASE:-999}"
+STRATEGY_VARIANT="${STRATEGY_VARIANT:-baseline}"
+FORWARD_DIR_MODE="${FORWARD_DIR_MODE:-default}"
+EXPERT2_FRONT_LAYOUT="${EXPERT2_FRONT_LAYOUT:-symmetric}"
+ENABLE_GOAL_MODE="${ENABLE_GOAL_MODE:-}"
+ENABLE_CLOSE_MODE="${ENABLE_CLOSE_MODE:-}"
+ENABLE_RUSH_MODE="${ENABLE_RUSH_MODE:-}"
 
 BC_EPOCHS="${BC_EPOCHS:-10}"
 BC_BATCH_SIZE="${BC_BATCH_SIZE:-4096}"
@@ -41,8 +50,13 @@ echo "  Expert BC Pipeline"
 echo "  collect batch_envs = ${GENERIC_BATCH_ENVS}"
 echo "  collect num_waves  = ${NUM_WAVES}"
 echo "  v_drone / v_prey   = ${V_DRONE_TEST} / ${V_PREY_TEST}"
+if [[ -n "${V_PREY_SCHEDULE}" ]]; then
+echo "  v_prey schedule    = ${V_PREY_SCHEDULE}"
+fi
 echo "  episode_length     = ${EPISODE_LENGTH}"
 echo "  dataset_root       = ${DATASET_ROOT}"
+echo "  dataset_name       = ${DATASET_NAME:-<timestamp>}"
+echo "  strategy           = ${STRATEGY_VARIANT}"
 echo "  bc epochs          = ${BC_EPOCHS}"
 echo "  bc batch_size      = ${BC_BATCH_SIZE}"
 echo "  bc device          = ${BC_DEVICE}"
@@ -60,10 +74,19 @@ find "${DATASET_ROOT}" -maxdepth 1 -mindepth 1 -type d | sort > "${before_list}"
 
 COLLECT_SUCCESS_DATASET=true \
 DATASET_DIR="${DATASET_ROOT}" \
+DATASET_NAME="${DATASET_NAME}" \
 MIN_SUCCESS_STEPS="${MIN_SUCCESS_STEPS}" \
 DATASET_DTYPE="${DATASET_DTYPE}" \
 GENERIC_BATCH_ENVS="${GENERIC_BATCH_ENVS}" \
 NUM_WAVES="${NUM_WAVES}" \
+V_PREY_SCHEDULE="${V_PREY_SCHEDULE}" \
+GENERIC_SEED_BASE="${GENERIC_SEED_BASE}" \
+STRATEGY_VARIANT="${STRATEGY_VARIANT}" \
+FORWARD_DIR_MODE="${FORWARD_DIR_MODE}" \
+EXPERT2_FRONT_LAYOUT="${EXPERT2_FRONT_LAYOUT}" \
+ENABLE_GOAL_MODE="${ENABLE_GOAL_MODE}" \
+ENABLE_CLOSE_MODE="${ENABLE_CLOSE_MODE}" \
+ENABLE_RUSH_MODE="${ENABLE_RUSH_MODE}" \
 EVAL_GPU="${EVAL_GPU}" \
 V_DRONE_TEST="${V_DRONE_TEST}" \
 EPISODE_LENGTH="${EPISODE_LENGTH}" \
