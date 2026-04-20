@@ -10,6 +10,26 @@ Website: https://sites.google.com/view/pursuit-evasion-rl
 
 This is the official repository of the paper "Multi-UAV Pursuit-Evasion with Online Planning in Unknown Environments by Deep Reinforcement Learning". This repository is heavily based on https://github.com/btx0424/OmniDrones.git.
 
+---
+
+## 🚀 Latest Update: V9 MAPPO Agent Breakthough (April 2026)
+
+We have successfully trained a high-performance MAPPO agent (`v9_mappo_93_success.pt`) that achieves a **93.4% interception success rate** under challenging symmetric speeds ($v_{drone}=1.5$ m/s, $v_{prey}=1.5$ m/s). 
+
+Key fixes included in this release:
+- **Optimizer State Restoration**: Fixed a checkpoint resumption bug that caused momentum loss.
+- **PPO Surrogate Clipping**: Restored `clip_param=0.1` to ensure robust policy gradient tracking.
+- **Exploration Stability**: Added an `entropy_coef=0.001` to avoid policy collapse into suboptimal loops.
+- **Expert Regularization**: Set `expert_kl_coef=0.13` properly.
+
+### Using the Pretrained V9 Weights
+The best V9 policy checkpoint is included in this repository. To evaluate logic or fine-tune from it:
+```bash
+python scripts/eval_policy_batch.py --checkpoint pretrained_weights/v9_mappo_93_success.pt
+```
+
+---
+
 <div align=center>
 <img src="https://github.com/jiayu-ch15/Multi-UAV-pursuit-evasion/blob/main/figures/overview.png" width="700"/>
 </div>
